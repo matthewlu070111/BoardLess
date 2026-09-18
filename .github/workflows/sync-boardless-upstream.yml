@@ -18,6 +18,7 @@ env:
   UPSTREAM_REPOSITORY: matthewlu070111/BoardLess
   UPSTREAM_BRANCH: main
   UPDATE_BRANCH: boardless-upstream-update
+  UPSTREAM_STATE_FILE: .boardless-upstream-commit
 
 jobs:
   sync:
@@ -31,8 +32,8 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Merge the latest upstream changes
-        id: merge
+      - name: Replace with the latest upstream snapshot
+        id: sync
         env:
           TARGET_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -45,67 +46,41 @@ jobs:
           git fetch --no-tags boardless-upstream "${UPSTREAM_BRANCH}"
           git checkout -B "${UPDATE_BRANCH}" "origin/${TARGET_BRANCH}"
 
-          abort_merge() {
-            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-              git merge --abort
-            fi
-          }
-
-          snapshot_fingerprint() {
-            # Cloudflare omits .github from the copied repository. Compare the
-            # remaining tracked files, including their modes and blob IDs.
-            git ls-tree -r --full-tree "$1" \
-              | awk -F '\t' '$2 !~ /^\.github(\/|$)/' \
-              | git hash-object --stdin
-          }
-
-          # Deploy to Cloudflare creates a repository copy with a new root
-          # commit rather than a GitHub fork, and excludes .github. Find the
-          # upstream commit whose remaining files were copied, then record it
-          # as the merge base without changing the deployed files. A direct
-          # unrelated-history merge would treat normal edits as add/add conflicts.
-          if ! git merge-base "origin/${TARGET_BRANCH}" "boardless-upstream/${UPSTREAM_BRANCH}" >/dev/null; then
-            upstream_base=""
-            while read -r target_root; do
-              target_fingerprint="$(snapshot_fingerprint "${target_root}")"
-              while read -r upstream_candidate; do
-                if [[ "$(snapshot_fingerprint "${upstream_candidate}")" == "${target_fingerprint}" ]]; then
-                  upstream_base="${upstream_candidate}"
-                  break
-                fi
-              done < <(git rev-list "boardless-upstream/${UPSTREAM_BRANCH}")
-              [[ -z "${upstream_base}" ]] || break
-            done < <(git rev-list --max-parents=0 "origin/${TARGET_BRANCH}")
-
-            if [[ -z "${upstream_base}" ]]; then
-              echo "Cannot identify which upstream commit this repository was copied from." >&2
-              echo "The initial repository snapshot may have been modified; resolve the first update manually." >&2
-              exit 1
-            fi
-
-            git merge \
-              --strategy=ours \
-              --no-edit \
-              --allow-unrelated-histories \
-              "${upstream_base}"
+          latest_upstream_commit="$(git rev-parse "boardless-upstream/${UPSTREAM_BRANCH}")"
+          previous_upstream_commit=""
+          if [[ -f "${UPSTREAM_STATE_FILE}" ]]; then
+            previous_upstream_commit="$(tr -d '[:space:]' < "${UPSTREAM_STATE_FILE}")"
           fi
 
-          if ! git merge --no-edit "boardless-upstream/${UPSTREAM_BRANCH}"; then
-            abort_merge
-            echo "Upstream changes conflict with this repository. Resolve the update manually." >&2
-            exit 1
-          fi
-
-          if [[ "$(git rev-list --count "origin/${TARGET_BRANCH}..HEAD")" -eq 0 ]]; then
+          if [[ "${previous_upstream_commit}" == "${latest_upstream_commit}" ]]; then
+            echo "Already synchronized with upstream commit ${latest_upstream_commit}."
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          # Replace the complete tracked tree. GitHub does not allow the
+          # repository GITHUB_TOKEN to create or update workflow files, so keep
+          # the deployed repository's workflow directory as the sole exception.
+          # Upstream workflow changes must be copied manually.
+          git read-tree --reset -u "boardless-upstream/${UPSTREAM_BRANCH}"
+          if ! git diff --quiet \
+            "origin/${TARGET_BRANCH}" \
+            "boardless-upstream/${UPSTREAM_BRANCH}" \
+            -- .github/workflows; then
+            echo "::warning::.github/workflows differs from upstream and was preserved. Copy workflow updates manually."
+          fi
+          git rm -r --force --quiet --ignore-unmatch .github/workflows
+          git checkout "origin/${TARGET_BRANCH}" -- .github/workflows
+
+          printf '%s\n' "${latest_upstream_commit}" > "${UPSTREAM_STATE_FILE}"
+          git add --all
+          git commit -m "Update BoardLess from upstream ${latest_upstream_commit:0:12}"
 
           git push --force origin "HEAD:refs/heads/${UPDATE_BRANCH}"
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
 
       - name: Create or update the upstream update pull request
-        if: steps.merge.outputs.has_changes == 'true'
+        if: steps.sync.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_BRANCH: ${{ github.event.repository.default_branch }}
@@ -128,4 +103,4 @@ jobs:
             --base "${TARGET_BRANCH}" \
             --head "${UPDATE_BRANCH}" \
             --title "Update BoardLess from upstream" \
-            --body $'This pull request was created automatically from `matthewlu070111/BoardLess` upstream changes.\n\nReview the diff and checks before merging. Merging into the production branch will trigger Cloudflare Workers Builds.'
+            --body $'This pull request replaces the tracked repository snapshot with the latest `matthewlu070111/BoardLess` upstream commit. `.github/workflows/` is preserved because GitHub does not permit `GITHUB_TOKEN` to update workflow files.\n\nOther downstream-only tracked files and modifications will be removed. Review the full diff and checks before merging. Merging into the production branch will trigger Cloudflare Workers Builds.'

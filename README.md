@@ -94,34 +94,18 @@ git remote add upstream https://github.com/matthewlu070111/BoardLess.git
 
 git fetch upstream
 git checkout main
-
-# 仅首次同步需要：找到 Cloudflare 复制时对应的上游快照并连接历史
-if ! git merge-base HEAD upstream/main >/dev/null; then
-  snapshot_fingerprint() {
-    git ls-tree -r --full-tree "$1" \
-      | awk -F '\t' '$2 !~ /^\.github(\/|$)/' \
-      | git hash-object --stdin
-  }
-  ROOT_COMMIT="$(git rev-list --max-parents=0 HEAD | head -n 1)"
-  ROOT_FINGERPRINT="$(snapshot_fingerprint "${ROOT_COMMIT}")"
-  UPSTREAM_BASE=""
-  while read -r CANDIDATE; do
-    if test "$(snapshot_fingerprint "${CANDIDATE}")" = "${ROOT_FINGERPRINT}"; then
-      UPSTREAM_BASE="${CANDIDATE}"
-      break
-    fi
-  done < <(git rev-list upstream/main)
-  test -n "${UPSTREAM_BASE}" || { echo "无法识别初始上游版本，请手动处理首次同步" >&2; exit 1; }
-  git merge -s ours --allow-unrelated-histories -m "Connect BoardLess upstream history" "${UPSTREAM_BASE}"
-fi
-
-git merge upstream/main
+git read-tree --reset -u upstream/main
+git rev-parse upstream/main > .boardless-upstream-commit
+git add --all
+git commit -m "Update BoardLess from upstream"
 git push origin main
 ```
 
-首次同步不能直接对最新上游使用 `--allow-unrelated-histories`：那会让 Git 把普通更新误判为同名文件的 `add/add` 冲突。上面的命令排除 Cloudflare 未复制的 `.github/` 后比较初始文件快照，找到真正的上游基线，用一个不改变文件的合并提交连接两条历史，再正常应用基线之后的更新。成功连接后，后续同步只会执行普通三方合并。如副本中存在自定义修改，仍需人工确认真实的内容冲突。
+同步采用完整快照替换，不依赖两个仓库是否拥有共同 Git 历史。它会删除仓库副本中仅本地存在的受跟踪文件，并覆盖所有受跟踪文件的本地修改；执行前应先备份需要保留的定制内容。`.boardless-upstream-commit` 记录本次使用的上游 commit，供自动检查判断是否已有新版本。
 
-最后的 `git push` 会自动触发 Workers Builds。如果仓库副本中有自定义修改，应在推送前解决合并冲突并完成测试。
+GitHub 不允许仓库自带的 `GITHUB_TOKEN` 新增或修改 `.github/workflows/` 中的文件，因此自动同步会把该目录恢复为仓库副本同步前的版本，不将其纳入覆盖。如果 Actions 日志提示上游工作流有变化，需要站长像首次启用时一样手动复制并提交新版工作流。除此目录外，其余受跟踪文件仍会全量覆盖。
+
+最后的 `git push` 会自动触发 Workers Builds。如果仓库副本中有自定义修改，应在覆盖前单独备份，并在推送前完成测试。
 
 如果不希望站长维护本地 Git 工作区，可以使用项目自带的 [GitHub Actions 上游同步模板](.github/workflows/sync-boardless-upstream.yml)。模板默认只允许仓库所有者在 GitHub 网页手动检查更新，不会自动定时运行；发现更新后会创建或更新 `boardless-upstream-update` 分支及 Pull Request，不会直接覆盖生产分支。
 
@@ -146,14 +130,14 @@ Deploy to Cloudflare 创建仓库副本后，在该仓库中完成以下设置�
 
    提交后 GitHub 才会开始定时运行；不取消注释就会一直保持纯手动模式。
 
-工作流不需要额外创建 Personal Access Token，使用仓库自动提供的 `GITHUB_TOKEN`，权限仅限写入更新分支和创建 Pull Request。发现更新后：
+工作流不需要额外创建 Personal Access Token，使用仓库自动提供的 `GITHUB_TOKEN`，权限仅限写入更新分支和创建 Pull Request。工作流读取 `.boardless-upstream-commit` 并与最新上游 commit 比较；记录不存在或 commit 不同时，都会用最新上游替换受跟踪文件并更新记录，同时保留目标仓库现有的 `.github/workflows/`。发现更新后：
 
 1. 打开机器人创建的 **Update BoardLess from upstream** Pull Request。
-2. 检查文件差异和测试结果，特别留意 `wrangler.jsonc` 以及自己的定制代码。
+2. 检查完整文件差异和测试结果，确认可以删除仓库副本中的受跟踪定制内容。
 3. 确认无误后合并 Pull Request。
 4. 合并产生的 `main` 分支 push 会触发 Cloudflare Workers Builds，自动执行 `npm run deploy`。
 
-如果上游修改与仓库副本存在 Git 冲突，工作流会安全停止并在 Actions 日志中报错，不会强制覆盖文件。此时仍需在本地解决冲突。要修改检查频率，可调整 `schedule` 中的 cron 表达式；要关闭自动检查，重新注释或删除 `schedule`，保留 `workflow_dispatch` 即可。
+完整快照替换不会产生 Git 合并冲突，但合并 Pull Request 后会覆盖 `.github/workflows/` 之外所有受跟踪的本地修改。要修改检查频率，可调整 `schedule` 中的 cron 表达式；要关闭自动检查，重新注释或删除 `schedule`，保留 `workflow_dispatch` 即可。
 
 模板还包含源仓库保护条件：当仓库本身是 `matthewlu070111/BoardLess` 时，同步任务会直接跳过，避免源仓库反向同步自身。自动检查仍然默认关闭，是否启用完全由部署者决定。
 

@@ -222,7 +222,9 @@ curl -X POST http://localhost:5173/api/setup/bootstrap \
 
 ## 后端仓库与节点一键安装
 
-站长可在“后端仓库”页面导入公开 GitHub 仓库。BoardLess 服务端会把分支或标签解析为不可变提交 SHA，读取该提交的 README，验证 `BOARDLESS_BACKEND_REPOSITORY_V1` 特征码、结构化预设和安装脚本 SHA-256。站长确认后，管理员可在“一键部署”页面选择预设并填写必需参数，系统会创建待审核节点并生成五分钟内单次有效的服务器安装命令。
+站长可在“后端仓库”页面导入公开 GitHub 仓库。BoardLess 服务端会把分支或标签解析为不可变提交 SHA，读取该提交的 README，验证 `BOARDLESS_BACKEND_REPOSITORY_V1` 特征码、结构化预设和安装脚本 SHA-256。站长确认后，管理员或站长从“节点”页面点击“新增节点”，依次选择已启用的后端和该后端提供的配置方案。字段标签、输入类型、占位提示、帮助文字和可选项都来自后端 README 的 `inputs` 声明，BoardLess 前端不再维护协议配置菜单。完成简单配置后，系统会创建待安装节点并生成五分钟内单次有效的服务器安装命令。
+
+以 BoardRay 为例，TLS 方案会要求填写节点域名、TLS SNI 和 ACME 邮箱；REALITY 方案会要求填写节点地址、REALITY SNI 和目标地址。两个方案都可选“同时同步到 VPS Panel”，勾选后才显示 VPS Panel 地址、一次性注册令牌和兼容版本，并生成 `--mode both` 安装命令。密钥等适合在服务器本机生成的内容不出现在表单中，而由安装程序生成后通过 bootstrap 接口只回传公开字段。
 
 节点 Agent 完成安装后使用一次性令牌调用 `/api/node/v1/bootstrap`，提交 README 已声明的公开生成字段并换取正式节点令牌。私钥必须始终保留在节点服务器；节点用户、凭据、套餐期限和配额只从 BoardLess `/api/node/v1/config` 获取。后端仓库的 README 格式和安装脚本参数见 [DEV.md](DEV.md#8-后端一键配置与安装规范)。
 

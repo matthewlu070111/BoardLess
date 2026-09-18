@@ -12,7 +12,7 @@ const manifest = {
   presets: [{
     id: "vless-reality", name: "VLESS Reality", protocol: "vless", description: "test",
     config: { server: "{{ input.server }}", port: 443, publicKey: "{{ generated.publicKey }}" },
-    requiredInputs: ["server"], generatedOutputs: ["publicKey"],
+    inputs: [{ key: "server", label: "节点地址", type: "hostname", placeholder: "node.example.com", help: "公网地址", installArg: "--domain" }], generatedOutputs: ["publicKey"],
   }],
 };
 
@@ -24,8 +24,29 @@ describe("backend repository manifests", () => {
   it("parses a valid manifest and renders declared inputs", () => {
     const parsed = parseBackendManifest(readme());
     expect(parsed.backendId).toBe("com.example.agent");
+    expect(parsed.presets[0].inputs).toEqual([{ key: "server", label: "节点地址", type: "hostname", placeholder: "node.example.com", help: "公网地址", installArg: "--domain", required: true }]);
     expect(renderPresetConfig(parsed.presets[0].config, { server: "node.example.com" })).toEqual({ server: "node.example.com", port: 443, publicKey: "{{ generated.publicKey }}" });
     expect(renderPresetConfig(parsed.presets[0].config, { server: "node.example.com" }, { publicKey: "pub" })).toEqual({ server: "node.example.com", port: 443, publicKey: "pub" });
+  });
+
+  it("keeps legacy requiredInputs compatible but rejects invalid menu metadata", () => {
+    const legacyPresets = [{ ...manifest.presets[0], inputs: undefined, requiredInputs: ["server"] }];
+    expect(parseBackendManifest(readme({ ...manifest, presets: legacyPresets })).presets[0].inputs).toEqual([{ key: "server", label: "server", type: "text", required: true }]);
+    const invalidPresets = [{ ...manifest.presets[0], inputs: [{ key: "mode", label: "模式", type: "select", options: [] }], config: { mode: "{{ input.mode }}" } }];
+    expect(() => parseBackendManifest(readme({ ...manifest, presets: invalidPresets }))).toThrow("options");
+  });
+
+  it("parses conditional checkbox and sensitive installation fields", () => {
+    const presets = [{ ...manifest.presets[0], inputs: [
+      ...manifest.presets[0].inputs,
+      { key: "enableVps", label: "同步 VPS Panel", type: "checkbox", required: false, default: "false", installArg: "--mode", checkedValue: "both", uncheckedValue: "boardless" },
+      { key: "token", label: "注册令牌", type: "password", installArg: "--vps-token", when: { key: "enableVps", equals: "true" } },
+    ] }];
+    const parsed = parseBackendManifest(readme({ ...manifest, presets }));
+    expect(parsed.presets[0].inputs[1]).toMatchObject({ type: "checkbox", required: false, checkedValue: "both" });
+    expect(parsed.presets[0].inputs[2]).toMatchObject({ sensitive: true, when: { key: "enableVps", equals: "true" } });
+    const leaking = [{ ...presets[0], config: { ...presets[0].config, leaked: "{{ input.token }}" } }];
+    expect(() => parseBackendManifest(readme({ ...manifest, presets: leaking }))).toThrow("只能用于安装参数");
   });
 
   it("rejects undeclared templates and unsafe script paths", () => {

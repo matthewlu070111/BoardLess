@@ -2,12 +2,36 @@ import type { Protocol } from "./types";
 
 export const BACKEND_RECOGNITION_CODE = "BOARDLESS_BACKEND_REPOSITORY_V1";
 
+export type BackendInputType = "text" | "hostname" | "email" | "number" | "url" | "password" | "select" | "checkbox";
+
+export interface BackendInputCondition {
+  key: string;
+  equals: string;
+}
+
+export interface BackendInput {
+  key: string;
+  label: string;
+  type: BackendInputType;
+  placeholder?: string;
+  help?: string;
+  default?: string;
+  required: boolean;
+  when?: BackendInputCondition;
+  installArg?: string;
+  checkedValue?: string;
+  uncheckedValue?: string;
+  sensitive?: boolean;
+  options?: Array<{ value: string; label: string }>;
+}
+
 export interface BackendPreset {
   id: string;
   name: string;
   protocol: Protocol;
   description: string;
   config: Record<string, unknown>;
+  inputs: BackendInput[];
   requiredInputs: string[];
   generatedOutputs: string[];
 }
@@ -59,13 +83,87 @@ function names(value: unknown, name: string): string[] {
   return result;
 }
 
+function optionalText(value: unknown, name: string, max: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > max) throw new Error(`${name} 格式无效`);
+  return value;
+}
+
+function inputDefinitions(preset: Record<string, unknown>, presetId: string): BackendInput[] {
+  if (preset.inputs === undefined) {
+    return names(preset.requiredInputs, `${presetId}.requiredInputs`).map((key) => ({ key, label: key, type: "text", required: true }));
+  }
+  if (!Array.isArray(preset.inputs) || !preset.inputs.length || preset.inputs.length > 64) throw new Error(`${presetId}.inputs 必须包含 1-64 个字段`);
+  const allowedTypes = new Set<BackendInputType>(["text", "hostname", "email", "number", "url", "password", "select", "checkbox"]);
+  const result = preset.inputs.map((item, index): BackendInput => {
+    const source = record(item, `${presetId}.inputs[${index}]`);
+    const key = shortText(source.key, `${presetId}.inputs[${index}].key`, 64);
+    if (!identifier.test(key)) throw new Error(`${presetId}.inputs 包含无效字段：${key}`);
+    const type = (source.type === undefined ? "text" : source.type) as BackendInputType;
+    if (!allowedTypes.has(type)) throw new Error(`${presetId}.${key}.type 不受支持`);
+    let options: BackendInput["options"];
+    if (type === "select") {
+      if (!Array.isArray(source.options) || source.options.length < 1 || source.options.length > 50) throw new Error(`${presetId}.${key}.options 必须包含 1-50 个选项`);
+      options = source.options.map((option, optionIndex) => {
+        const parsed = record(option, `${presetId}.${key}.options[${optionIndex}]`);
+        return {
+          value: shortText(parsed.value, `${presetId}.${key}.options[${optionIndex}].value`, 160),
+          label: shortText(parsed.label, `${presetId}.${key}.options[${optionIndex}].label`, 100),
+        };
+      });
+      if (new Set(options.map((option) => option.value)).size !== options.length) throw new Error(`${presetId}.${key}.options 不能重复`);
+    } else if (source.options !== undefined) {
+      throw new Error(`${presetId}.${key}.options 仅适用于 select`);
+    }
+    const defaultValue = optionalText(source.default, `${presetId}.${key}.default`, 512);
+    if (options && defaultValue !== undefined && !options.some((option) => option.value === defaultValue)) throw new Error(`${presetId}.${key}.default 必须属于 options`);
+    if (type === "checkbox" && defaultValue !== undefined && !["true", "false"].includes(defaultValue)) throw new Error(`${presetId}.${key}.default 必须是 true 或 false`);
+    let when: BackendInputCondition | undefined;
+    if (source.when !== undefined) {
+      const condition = record(source.when, `${presetId}.${key}.when`);
+      when = {
+        key: shortText(condition.key, `${presetId}.${key}.when.key`, 64),
+        equals: shortText(condition.equals, `${presetId}.${key}.when.equals`, 160),
+      };
+      if (!identifier.test(when.key) || when.key === key) throw new Error(`${presetId}.${key}.when 无效`);
+    }
+    const checkedValue = optionalText(source.checkedValue, `${presetId}.${key}.checkedValue`, 160);
+    const uncheckedValue = optionalText(source.uncheckedValue, `${presetId}.${key}.uncheckedValue`, 160);
+    if (type !== "checkbox" && (checkedValue !== undefined || uncheckedValue !== undefined)) throw new Error(`${presetId}.${key} 只有 checkbox 可声明 checkedValue`);
+    if (source.required !== undefined && typeof source.required !== "boolean") throw new Error(`${presetId}.${key}.required 必须是布尔值`);
+    return {
+      key,
+      label: shortText(source.label, `${presetId}.${key}.label`, 100),
+      type,
+      ...(optionalText(source.placeholder, `${presetId}.${key}.placeholder`, 160) !== undefined ? { placeholder: String(source.placeholder) } : {}),
+      ...(optionalText(source.help, `${presetId}.${key}.help`, 300) !== undefined ? { help: String(source.help) } : {}),
+      ...(defaultValue !== undefined ? { default: defaultValue } : {}),
+      required: source.required === undefined ? true : source.required === true,
+      ...(when ? { when } : {}),
+      ...(source.installArg !== undefined ? { installArg: shortText(source.installArg, `${presetId}.${key}.installArg`, 80) } : {}),
+      ...(checkedValue !== undefined ? { checkedValue } : {}),
+      ...(uncheckedValue !== undefined ? { uncheckedValue } : {}),
+      ...(source.sensitive === true || type === "password" ? { sensitive: true } : {}),
+      ...(options ? { options } : {}),
+    };
+  });
+  if (new Set(result.map((input) => input.key)).size !== result.length) throw new Error(`${presetId}.inputs 包含重复字段`);
+  const inputKeys = new Set(result.map((input) => input.key));
+  if (result.some((input) => input.when && !inputKeys.has(input.when.key))) throw new Error(`${presetId}.inputs 的 when 引用了不存在的字段`);
+  const installArgs = result.flatMap((input) => input.installArg ? [input.installArg] : []);
+  if (installArgs.some((argument) => !/^--[a-z0-9][a-z0-9-]*$/.test(argument)) || new Set(installArgs).size !== installArgs.length) {
+    throw new Error(`${presetId}.inputs 包含无效或重复的 installArg`);
+  }
+  return result;
+}
+
 function safePath(value: unknown, name: string): string {
   const path = shortText(value, name, 240);
   if (!relativePath.test(path) || path.includes("//")) throw new Error(`${name} 必须是仓库内相对路径`);
   return path;
 }
 
-function validateTemplates(value: unknown, inputs: Set<string>, generated: Set<string>, depth = 0): void {
+function validateTemplates(value: unknown, inputs: Set<string>, generated: Set<string>, disallowedInputs = new Set<string>(), depth = 0): void {
   if (depth > 12) throw new Error("预设配置嵌套过深");
   if (typeof value === "string") {
     const expressions = [...value.matchAll(/{{\s*(input|generated)\.([A-Za-z0-9._-]+)\s*}}/g)];
@@ -73,15 +171,16 @@ function validateTemplates(value: unknown, inputs: Set<string>, generated: Set<s
     if (stripped.includes("{{") || stripped.includes("}}")) throw new Error("预设包含不支持的模板表达式");
     for (const match of expressions) {
       if (match[1] === "input" && !inputs.has(match[2])) throw new Error(`预设引用了未声明输入：${match[2]}`);
+      if (match[1] === "input" && disallowedInputs.has(match[2])) throw new Error(`条件或敏感输入只能用于安装参数：${match[2]}`);
       if (match[1] === "generated" && !generated.has(match[2])) throw new Error(`预设引用了未声明生成字段：${match[2]}`);
     }
   } else if (Array.isArray(value)) {
     if (value.length > 100) throw new Error("预设数组过长");
-    value.forEach((item) => validateTemplates(item, inputs, generated, depth + 1));
+    value.forEach((item) => validateTemplates(item, inputs, generated, disallowedInputs, depth + 1));
   } else if (value && typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>);
     if (entries.length > 100) throw new Error("预设字段过多");
-    entries.forEach(([, item]) => validateTemplates(item, inputs, generated, depth + 1));
+    entries.forEach(([, item]) => validateTemplates(item, inputs, generated, disallowedInputs, depth + 1));
   }
 }
 
@@ -113,17 +212,19 @@ export function parseBackendManifest(readme: string): BackendManifest {
     const id = shortText(preset.id, `presets[${index}].id`, 64);
     if (!identifier.test(id)) throw new Error(`预设 ID 无效：${id}`);
     if (!protocols.has(preset.protocol as Protocol)) throw new Error(`预设协议不受支持：${String(preset.protocol)}`);
-    const requiredInputs = names(preset.requiredInputs, `${id}.requiredInputs`);
+    const inputs = inputDefinitions(preset, id);
+    const requiredInputs = inputs.map((input) => input.key);
     const generatedOutputs = names(preset.generatedOutputs, `${id}.generatedOutputs`);
     if (generatedOutputs.some((field) => /private|secret|password|token/i.test(field))) throw new Error(`${id}.generatedOutputs 只能声明公开字段，不能包含私钥、密码或令牌`);
     const config = record(preset.config, `${id}.config`);
-    validateTemplates(config, new Set(requiredInputs), new Set(generatedOutputs));
+    validateTemplates(config, new Set(requiredInputs), new Set(generatedOutputs), new Set(inputs.filter((input) => input.sensitive || input.when).map((input) => input.key)));
     return {
       id,
       name: shortText(preset.name, `${id}.name`, 100),
       protocol: preset.protocol as Protocol,
       description: typeof preset.description === "string" ? preset.description.slice(0, 500) : "",
       config,
+      inputs,
       requiredInputs,
       generatedOutputs,
     };

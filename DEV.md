@@ -803,7 +803,22 @@ https://github.com/<OWNER>/<BACKEND_REPO>
         "realityPublicKey": "{{ generated.realityPublicKey }}",
         "shortId": "{{ generated.shortId }}"
       },
-      "requiredInputs": ["server", "sni"],
+      "inputs": [
+        {
+          "key": "server",
+          "label": "节点地址",
+          "type": "hostname",
+          "installArg": "--domain",
+          "placeholder": "hk.example.com",
+          "help": "填写客户端可访问的域名或公网 IP"
+        },
+        {
+          "key": "sni",
+          "label": "REALITY SNI",
+          "type": "hostname",
+          "placeholder": "www.example.com"
+        }
+      ],
       "generatedOutputs": ["realityPublicKey", "shortId"]
     }
   ]
@@ -823,8 +838,14 @@ https://github.com/<OWNER>/<BACKEND_REPO>
 | `install.script` | 仓库内节点安装脚本的相对路径 |
 | `install.sha256` | 对应提交中安装脚本的 SHA-256 |
 | `presets` | 后端官方维护的节点配置范例 |
-| `requiredInputs` | 管理员在面板中必须填写的字段 |
+| `inputs` | 后端提供给新增节点页面的字段定义；每项包含 `key`、`label`、`type`，并可包含 `placeholder`、`help`、`default`、`required`、`options`、`when`、`installArg`、`checkedValue`、`uncheckedValue`、`sensitive` |
 | `generatedOutputs` | 安装时在节点服务器生成并回传的公开字段 |
+
+`inputs[].type` 目前支持 `text`、`hostname`、`email`、`number`、`url`、`password`、`select` 和 `checkbox`。`select` 必须提供 `{ "value", "label" }` 组成的 `options`。字段默认必填，只有明确声明 `required: false` 才可为空；`when: { "key": "enableFeature", "equals": "true" }` 可让字段仅在另一个字段取指定值时显示并生效。
+
+需要传给安装脚本的字段应声明唯一的 `installArg`，其格式必须为 `--lowercase-kebab-case`；BoardLess 会逐项进行 Shell 引号处理。复选框可以通过 `checkedValue` 和 `uncheckedValue` 把布尔状态映射为脚本值，例如把勾选状态映射成 `--mode both`、未勾选映射成 `--mode boardless`。`password` 会自动视为敏感字段，也可显式设置 `sensitive: true`；敏感值只参与当次安装命令，不写入 BoardLess 的节点配置或安装令牌记录。带 `when` 的条件字段和敏感字段属于安装专用输入，不能被节点 `config` 模板引用。
+
+字段 `key` 必须唯一，并与 `{{ input.<key> }}` 模板引用一致。为兼容早期后端，BoardLess 仍可读取字符串数组形式的 `requiredInputs`，但这类字段只能显示裸字段名，也无法声明条件或安装参数；新后端应使用 `inputs`。
 
 私钥只能保存在节点服务器。`generatedOutputs` 只能包含公钥、Short ID、公开端口等可公开配置，不能上传 Reality 私钥或其他服务端秘密。
 
@@ -856,10 +877,12 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 | `POST` | `/api/owner/backends/:id/confirm` | 确认首次导入或高风险更新 |
 | `POST` | `/api/owner/backends/:id/sync` | 按指定 ref 重新同步并生成差异 |
 | `PATCH` | `/api/owner/backends/:id` | 启用或停用已确认后端；切换 ref 使用同步接口 |
-| `GET` | `/api/admin/node-presets` | 返回已启用后端的配置预设 |
-| `POST` | `/api/admin/nodes/from-preset` | 根据后端预设和输入创建待安装节点 |
-| `POST` | `/api/admin/nodes/:id/install-command` | 生成短期有效的一次性节点安装命令 |
+| `GET` | `/api/deploy/presets` | 管理员或站长读取已启用后端的配置预设和表单字段 |
+| `POST` | `/api/deploy/nodes` | 管理员或站长根据后端预设和输入创建待安装节点 |
+| `POST` | `/api/deploy/nodes/:id/install-command` | 为自己创建的待安装节点生成短期有效的一次性安装命令 |
 | `POST` | `/api/node/v1/bootstrap` | Agent 首次启动时兑换安装令牌并提交公开配置 |
+
+原有 `/api/admin/node-presets`、`/api/admin/nodes/from-preset` 和 `/api/admin/nodes/:id/install-command` 继续保留兼容；Web 前端统一使用 `/api/deploy/*`。
 
 导入预览请求示例：
 
@@ -891,15 +914,16 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 
 配置流程：
 
-1. BoardLess 展示 README 中已校验的 `requiredInputs` 表单
-2. 服务端合并预设和管理员输入，浏览器不能自行生成最终配置
-3. 没有 `generatedOutputs` 时直接执行现有 `validateNodeConfig`
-4. 存在安装阶段输出时，先校验已知字段并保持节点为 `pending`
-5. BoardLess 为该节点签发 5 分钟内单次有效的安装令牌
-6. 目标服务器安装脚本生成 Reality 密钥等本机数据
-7. Agent 通过 `/api/node/v1/bootstrap` 提交公钥等 `generatedOutputs` 并兑换正式节点令牌
-8. BoardLess 合并公开输出并执行完整 `validateNodeConfig`
-9. 管理员节点等待站长审核；审核通过且加入套餐后才会收到用户
+1. BoardLess 先展示已启用后端，再展示所选后端的配置方案
+2. BoardLess 严格按 README 中已校验的 `inputs` 生成表单，不在前端硬编码协议字段
+3. 服务端合并预设和管理员输入，浏览器不能自行生成最终配置
+4. 没有 `generatedOutputs` 时直接执行现有 `validateNodeConfig`
+5. 存在安装阶段输出时，先校验已知字段并保持节点为 `pending`
+6. BoardLess 为该节点签发 5 分钟内单次有效的安装令牌
+7. 目标服务器安装脚本生成 Reality 密钥等本机数据
+8. Agent 通过 `/api/node/v1/bootstrap` 提交公钥等 `generatedOutputs` 并兑换正式节点令牌
+9. BoardLess 合并公开输出并执行完整 `validateNodeConfig`
+10. 节点等待站长审核；审核通过且加入套餐后才会收到用户
 
 “一键配置”只配置节点运行参数，不得在 BoardLess 数据库之外创建用户。
 

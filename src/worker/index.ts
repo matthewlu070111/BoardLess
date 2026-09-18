@@ -9,7 +9,7 @@ import { closeEntitlement, proratedCredit, settleExpiredEntitlements, settleNode
 import { createAlipayQr, openPaymentSecrets, queryAlipayOrder, resolveAlipayConfig, sealPaymentSecrets, verifyAlipayNotification } from "./payment";
 import { renderSubscription, validateNodeConfig } from "./protocols";
 import type { AppVariables, Env, NodeRow, PlanRow, Protocol, Role } from "./types";
-import { importBackendRepository, renderPresetConfig, type BackendPreset, type ImportedBackend } from "./backends";
+import { importBackendRepository, renderPresetConfig, type BackendInput, type BackendPreset, type ImportedBackend } from "./backends";
 
 type App = { Bindings: Env; Variables: AppVariables };
 export const app = new Hono<App>();
@@ -122,6 +122,7 @@ app.get("/api/me", async (c) => c.json({ user: publicUser(c.get("user")) }));
 app.use("/api/app/*", authMiddleware);
 app.use("/api/admin/*", authMiddleware, requireRole("admin"));
 app.use("/api/owner/*", authMiddleware, requireRole("owner"));
+app.use("/api/deploy/*", authMiddleware, requireRole("admin", "owner"));
 
 app.get("/api/app/dashboard", async (c) => {
   const user = c.get("user");
@@ -390,7 +391,7 @@ async function saveImportedBackend(env: Env, actorId: string, imported: Imported
       `INSERT INTO backend_presets
        (backend_repository_id, preset_id, name, protocol, description, config_json, required_inputs_json, generated_outputs_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(id, preset.id, preset.name, preset.protocol, preset.description, JSON.stringify(preset.config), JSON.stringify(preset.requiredInputs), JSON.stringify(preset.generatedOutputs))),
+    ).bind(id, preset.id, preset.name, preset.protocol, preset.description, JSON.stringify(preset.config), JSON.stringify(preset.inputs), JSON.stringify(preset.generatedOutputs))),
   ];
   await env.DB.batch(statements);
   await audit(env, actorId, byBackend || byRepository ? "backend.sync.preview" : "backend.import.preview", "backend_repository", id, {
@@ -408,6 +409,40 @@ function parseStringArray(value: string): string[] {
     const parsed = JSON.parse(value) as unknown;
     return Array.isArray(parsed) ? parsed.map(String) : [];
   } catch { return []; }
+}
+
+function parseBackendInputs(value: string): BackendInput[] {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => typeof item === "string"
+      ? { key: item, label: item, type: "text" as const, required: true }
+      : { ...(item as BackendInput), required: (item as BackendInput).required !== false });
+  } catch { return []; }
+}
+
+function backendInputActive(field: BackendInput, values: Record<string, unknown>): boolean {
+  return !field.when || String(values[field.when.key] ?? "") === field.when.equals;
+}
+
+function normalizeBackendInputs(definitions: BackendInput[], raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("inputs 必须是对象");
+  const supplied = raw as Record<string, unknown>;
+  const declared = new Set(definitions.map((field) => field.key));
+  if (Object.keys(supplied).some((key) => !declared.has(key))) throw new Error("inputs 包含预设未声明的字段");
+  const effective: Record<string, unknown> = Object.fromEntries(definitions.map((field) => [field.key, field.type === "checkbox" ? field.default || "false" : field.default || ""]));
+  Object.assign(effective, supplied);
+  const values: Record<string, string> = {};
+  for (const field of definitions) {
+    if (!backendInputActive(field, effective)) continue;
+    const fallback = field.type === "checkbox" ? field.default || "false" : field.default || "";
+    const value = supplied[field.key] === undefined ? fallback : String(supplied[field.key]).trim();
+    if (field.type === "checkbox" && !["true", "false"].includes(value)) throw new Error(`预设输入必须是布尔值：${field.key}`);
+    if (!value && field.required !== false) throw new Error(`缺少或无效的预设输入：${field.key}`);
+    if (value.length > 512) throw new Error(`缺少或无效的预设输入：${field.key}`);
+    if (value) values[field.key] = value;
+  }
+  return values;
 }
 
 app.get("/api/owner/backends", async (c) => {
@@ -430,7 +465,7 @@ app.post("/api/owner/backends/import", async (c) => {
       repositoryUrl: imported.repositoryUrl, requestedRef: imported.requestedRef, commitSha: imported.commitSha,
       readmeHash: imported.readmeHash, installScript: imported.manifest.install.script,
       installSha256: imported.manifest.install.sha256,
-      presets: imported.manifest.presets.map(({ id, name, protocol, description, requiredInputs, generatedOutputs }) => ({ id, name, protocol, description, requiredInputs, generatedOutputs })),
+      presets: imported.manifest.presets.map(({ id, name, protocol, description, inputs, generatedOutputs }) => ({ id, name, protocol, description, inputs, generatedOutputs })),
     },
   }, 201);
 });
@@ -467,8 +502,9 @@ app.patch("/api/owner/backends/:id", async (c) => {
   return c.json({ ok: true, status });
 });
 
-app.get("/api/admin/node-presets", async (c) => {
-  await ensureActiveAdmin(c.env, c.get("user").id);
+async function listNodePresets(c: Context<App>) {
+  const user = c.get("user");
+  if (user.roles.includes("admin")) await ensureActiveAdmin(c.env, user.id);
   const rows = await c.env.DB.prepare(
     `SELECT p.*, b.backend_id, b.name AS backend_name, b.version AS backend_version, b.commit_sha
      FROM backend_presets p JOIN backend_repositories b ON b.id = p.backend_repository_id
@@ -477,16 +513,17 @@ app.get("/api/admin/node-presets", async (c) => {
   return c.json({ presets: rows.results.map((row) => ({
     ...row,
     config: JSON.parse(String(row.config_json)),
-    requiredInputs: parseStringArray(String(row.required_inputs_json)),
+    inputs: parseBackendInputs(String(row.required_inputs_json)),
+    requiredInputs: parseBackendInputs(String(row.required_inputs_json)).map((input) => input.key),
     generatedOutputs: parseStringArray(String(row.generated_outputs_json)),
     config_json: undefined, required_inputs_json: undefined, generated_outputs_json: undefined,
   })) });
-});
+}
 
-app.post("/api/admin/nodes/from-preset", async (c) => {
+async function createNodeFromPreset(c: Context<App>) {
   assertMutation(c);
   const user = c.get("user");
-  await ensureActiveAdmin(c.env, user.id);
+  if (user.roles.includes("admin")) await ensureActiveAdmin(c.env, user.id);
   const input = await body<{ backendId: string; presetId: string; name: string; inputs: Record<string, unknown> }>(c);
   if (!input.name?.trim() || input.name.length > 80) return c.json({ error: "节点名称不能为空且最多 80 字" }, 400);
   const row = await c.env.DB.prepare(
@@ -495,55 +532,75 @@ app.post("/api/admin/nodes/from-preset", async (c) => {
      WHERE b.backend_id = ? AND p.preset_id = ? AND b.status = 'enabled'`,
   ).bind(String(input.backendId || ""), String(input.presetId || "")).first<Record<string, unknown>>();
   if (!row) return c.json({ error: "后端预设不存在或尚未启用" }, 404);
-  const requiredInputs = parseStringArray(String(row.required_inputs_json));
-  const values: Record<string, string> = {};
-  if (!input.inputs || typeof input.inputs !== "object" || Array.isArray(input.inputs)) return c.json({ error: "inputs 必须是对象" }, 400);
-  for (const key of requiredInputs) {
-    const value = input.inputs[key];
-    if (typeof value !== "string" || !value.trim() || value.length > 512) return c.json({ error: `缺少或无效的预设输入：${key}` }, 400);
-    values[key] = value.trim();
-  }
-  if (Object.keys(input.inputs).some((key) => !requiredInputs.includes(key))) return c.json({ error: "inputs 包含预设未声明的字段" }, 400);
+  const inputDefinitions = parseBackendInputs(String(row.required_inputs_json));
+  const values = normalizeBackendInputs(inputDefinitions, input.inputs);
   const generatedOutputs = parseStringArray(String(row.generated_outputs_json));
   const template = JSON.parse(String(row.config_json)) as Record<string, unknown>;
   const rendered = renderPresetConfig(template, values) as Record<string, unknown>;
   const config = generatedOutputs.length ? rendered : validateNodeConfig(row.protocol as Protocol, rendered);
   const id = newId("node");
+  const storedValues = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, inputDefinitions.find((field) => field.key === key)?.sensitive ? "" : value]));
   await c.env.DB.prepare(
     `INSERT INTO nodes
-     (id, owner_admin_id, name, protocol, status, config_json, token_hash, created_at, updated_at, backend_repository_id, backend_preset_id)
-     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
-  ).bind(id, user.id, input.name.trim(), row.protocol, JSON.stringify(config), await sha256(randomToken(32)), now(), now(), row.backend_repository_id, row.preset_id).run();
+     (id, owner_admin_id, name, protocol, status, config_json, token_hash, created_at, updated_at, backend_repository_id, backend_preset_id, backend_inputs_json)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, user.id, input.name.trim(), row.protocol, JSON.stringify(config), await sha256(randomToken(32)), now(), now(), row.backend_repository_id, row.preset_id, JSON.stringify(storedValues)).run();
   await audit(c.env, user.id, "node.create.from_preset", "node", id, { backendId: row.backend_id, presetId: row.preset_id });
   return c.json({ node: { id, name: input.name.trim(), protocol: row.protocol, status: "pending", config }, generatedOutputs }, 201);
-});
+}
 
-app.post("/api/admin/nodes/:id/install-command", async (c) => {
+async function createNodeInstallCommand(c: Context<App>) {
   assertMutation(c);
   const user = c.get("user");
-  await ensureActiveAdmin(c.env, user.id);
+  if (user.roles.includes("admin")) await ensureActiveAdmin(c.env, user.id);
   const row = await c.env.DB.prepare(
-    `SELECT n.id, n.backend_preset_id, b.id AS backend_repository_id, b.install_script_url, b.install_sha256, b.version, b.status
+    `SELECT n.id, n.backend_preset_id, n.backend_inputs_json, b.id AS backend_repository_id, b.install_script_url, b.install_sha256, b.version, b.status,
+       p.required_inputs_json
      FROM nodes n JOIN backend_repositories b ON b.id = n.backend_repository_id
+     JOIN backend_presets p ON p.backend_repository_id = n.backend_repository_id AND p.preset_id = n.backend_preset_id
      WHERE n.id = ? AND n.owner_admin_id = ? AND n.status = 'pending'`,
   ).bind(c.req.param("id"), user.id).first<Record<string, unknown>>();
   if (!row || row.status !== "enabled") return c.json({ error: "节点不存在、状态无效或后端未启用" }, 404);
   const token = randomToken(32);
   const expiresAt = now() + 300;
+  const storedValues = JSON.parse(String(row.backend_inputs_json || "{}")) as Record<string, string>;
+  const inputDefinitions = parseBackendInputs(String(row.required_inputs_json));
+  const request = await body<{ inputs?: Record<string, unknown> }>(c);
+  const inputValues = normalizeBackendInputs(inputDefinitions, request.inputs || storedValues);
+  for (const field of inputDefinitions) {
+    if (!field.sensitive && (storedValues[field.key] || "") !== (inputValues[field.key] || "")) return c.json({ error: "节点配置与安装参数不一致，请重新创建节点" }, 400);
+  }
+  const installArguments = inputDefinitions.flatMap((field) => {
+    if (!field.installArg || !backendInputActive(field, inputValues)) return [];
+    const value = inputValues[field.key] || "";
+    if (field.type === "checkbox") {
+      const mapped = value === "true" ? field.checkedValue : field.uncheckedValue;
+      return mapped ? [field.installArg, mapped] : value === "true" ? [field.installArg] : [];
+    }
+    return value ? [field.installArg, value] : [];
+  });
+  const retainedInputs = Object.fromEntries(Object.entries(inputValues).filter(([key]) => !inputDefinitions.find((field) => field.key === key)?.sensitive));
   await c.env.DB.prepare(
     `INSERT INTO node_install_tokens
      (id, token_hash, node_id, backend_repository_id, preset_id, inputs_json, expires_at, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?)`,
-  ).bind(newId("install"), await sha256(token), row.id, row.backend_repository_id, row.backend_preset_id, expiresAt, user.id, now()).run();
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(newId("install"), await sha256(token), row.id, row.backend_repository_id, row.backend_preset_id, JSON.stringify(retainedInputs), expiresAt, user.id, now()).run();
   const file = "/tmp/boardless-node-install.sh";
   const command = [
     `curl -fsSL ${shellQuote(String(row.install_script_url))} -o ${shellQuote(file)}`,
     `echo ${shellQuote(`${row.install_sha256}  ${file}`)} | sha256sum -c -`,
-    `sudo bash ${shellQuote(file)} --panel-url ${shellQuote(c.env.APP_ORIGIN.replace(/\/$/, ""))} --install-token ${shellQuote(token)} --preset ${shellQuote(String(row.backend_preset_id))} --agent-version ${shellQuote(String(row.version))} --unattended`,
+    `sudo bash ${shellQuote(file)} --panel-url ${shellQuote(c.env.APP_ORIGIN.replace(/\/$/, ""))} --install-token ${shellQuote(token)} --preset ${shellQuote(String(row.backend_preset_id))} --agent-version ${shellQuote(String(row.version))}${installArguments.map((value) => ` ${shellQuote(value)}`).join("")} --unattended`,
   ].join(" && \\\n  ");
   await audit(c.env, user.id, "node.install_command.create", "node", String(row.id), { expiresAt });
   return c.json({ command, expiresAt, sha256: row.install_sha256, scriptUrl: row.install_script_url });
-});
+}
+
+app.get("/api/admin/node-presets", listNodePresets);
+app.post("/api/admin/nodes/from-preset", createNodeFromPreset);
+app.post("/api/admin/nodes/:id/install-command", createNodeInstallCommand);
+app.get("/api/deploy/presets", listNodePresets);
+app.post("/api/deploy/nodes", createNodeFromPreset);
+app.post("/api/deploy/nodes/:id/install-command", createNodeInstallCommand);
 
 app.post("/api/node/v1/bootstrap", async (c) => {
   const input = await body<{ installToken: string; generatedOutputs?: Record<string, unknown>; agentVersion?: string }>(c);
@@ -797,8 +854,12 @@ app.post("/api/owner/nodes/:id/action", async (c) => {
   assertMutation(c);
   const input = await body<{ action: "approve" | "suspend" }>(c);
   if (!(["approve", "suspend"] as string[]).includes(input.action)) return c.json({ error: "操作无效" }, 400);
-  const node = await c.env.DB.prepare("SELECT id, status FROM nodes WHERE id = ?").bind(c.req.param("id")).first();
+  const node = await c.env.DB.prepare("SELECT id, status, protocol, config_json, backend_repository_id, agent_version FROM nodes WHERE id = ?").bind(c.req.param("id")).first<Record<string, unknown>>();
   if (!node) return c.json({ error: "节点不存在" }, 404);
+  if (input.action === "approve") {
+    if (node.backend_repository_id && !node.agent_version) return c.json({ error: "节点尚未完成安装和 bootstrap，不能审核通过" }, 400);
+    validateNodeConfig(node.protocol as Protocol, JSON.parse(String(node.config_json)));
+  }
   const status = input.action === "approve" ? "approved" : "suspended";
   await c.env.DB.prepare("UPDATE nodes SET status = ?, updated_at = ? WHERE id = ? AND status != 'archived'").bind(status, now(), c.req.param("id")).run();
   await audit(c.env, c.get("user").id, `node.${input.action}`, "node", c.req.param("id"));

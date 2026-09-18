@@ -105,7 +105,6 @@ const userNav: NavItem[] = [
 ];
 const adminNav: NavItem[] = [
   { to: "/admin", label: "概览", icon: "⌂" }, { to: "/admin/nodes", label: "我的节点", icon: "⌘" },
-  { to: "/admin/deploy", label: "一键部署", icon: "↯" },
   { to: "/admin/users", label: "邀请用户", icon: "♙" }, { to: "/admin/earnings", label: "收益与提现", icon: "¥" },
 ];
 const ownerNav: NavItem[] = [
@@ -240,71 +239,61 @@ function Orders() {
 function AdminDashboard() {
   const [data, setData] = useState<Json | null>(null); useEffect(() => { api("/api/admin/overview").then(setData); }, []);
   if (!data) return <Loading />;
-  return <Page title="管理员概览" description="你的节点、用户与可提现收益"><div className="stat-grid four"><Stat label="节点" value={String(data.nodeCount)} hint="仅你可以维护配置" /><Stat label="邀请用户" value={String(data.invitedUsers)} hint="归属关系固定" /><Stat label="可提现" value={money(data.availableCents)} hint="最低 ¥100" /><Stat label="待处理提现" value={String(data.pendingWithdrawals)} hint="由站长人工核销" /></div><section className="panel"><h2>节点接入流程</h2><div className="steps"><span><b>1</b> 新增节点并保存一次性令牌</span><span><b>2</b> 部署节点端并接入 API</span><span><b>3</b> 等待站长审核</span><span><b>4</b> 节点进入套餐后拉取用户</span></div></section></Page>;
+  return <Page title="管理员概览" description="你的节点、用户与可提现收益"><div className="stat-grid four"><Stat label="节点" value={String(data.nodeCount)} hint="仅你可以维护配置" /><Stat label="邀请用户" value={String(data.invitedUsers)} hint="归属关系固定" /><Stat label="可提现" value={money(data.availableCents)} hint="最低 ¥100" /><Stat label="待处理提现" value={String(data.pendingWithdrawals)} hint="由站长人工核销" /></div><section className="panel"><h2>节点接入流程</h2><div className="steps"><span><b>1</b> 选择站长启用的节点后端</span><span><b>2</b> 按后端提供的表单完成配置</span><span><b>3</b> 在服务器执行一次性安装命令</span><span><b>4</b> 等待站长审核并加入套餐</span></div></section></Page>;
 }
 
-const protocolFields: Record<string, Array<[string, string, string?]>> = {
-  shadowsocks: [["method", "加密方式", "aes-256-gcm"]],
-  vmess: [["transport", "传输方式", "tcp"], ["sni", "SNI"], ["path", "路径"]],
-  vless: [["transport", "传输方式", "tcp"], ["sni", "SNI"], ["flow", "Flow"], ["realityPublicKey", "Reality 公钥"], ["shortId", "Short ID"]],
-  trojan: [["transport", "传输方式", "tcp"], ["sni", "SNI"], ["path", "路径"]],
-  hysteria2: [["sni", "SNI"], ["obfs", "混淆方式"], ["obfsPassword", "混淆密码"], ["upMbps", "上行 Mbps", "100"], ["downMbps", "下行 Mbps", "100"]],
-  tuic: [["sni", "SNI"], ["congestionControl", "拥塞控制", "bbr"], ["udpRelayMode", "UDP 模式", "native"]],
-};
-
 function AdminNodes() {
-  const [nodes, setNodes] = useState<Json[] | null>(null); const [show, setShow] = useState(false); const [token, setToken] = useState(""); const [error, setError] = useState("");
-  const [form, setForm] = useState<Json>({ name: "", protocol: "vless", server: "", port: "443", tls: true, transport: "tcp" });
+  const [nodes, setNodes] = useState<Json[] | null>(null); const [token, setToken] = useState("");
   const load = () => api<{ nodes: Json[] }>("/api/admin/nodes").then((r) => setNodes(r.nodes)); useEffect(() => { void load(); }, []);
-  const save = async (event: FormEvent) => {
-    event.preventDefault(); setError("");
-    const config: Json = { server: form.server, port: Number(form.port), tls: Boolean(form.tls), udp: true };
-    for (const [key] of protocolFields[form.protocol] || []) if (form[key] !== "" && form[key] !== undefined) config[key] = ["upMbps", "downMbps"].includes(key) ? Number(form[key]) : form[key];
-    try { const result = await api<Json>("/api/admin/nodes", { method: "POST", body: JSON.stringify({ name: form.name, protocol: form.protocol, config }) }); setToken(result.token); setShow(false); await load(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); }
-  };
   const rotate = async (id: string) => { if (!confirm("旧令牌会立即失效，继续吗？")) return; const result = await api<Json>(`/api/admin/nodes/${id}/rotate-token`, { method: "POST", body: "{}" }); setToken(result.token); };
   if (!nodes) return <Loading />;
-  return <Page title="我的节点" description="节点配置只由上传管理员维护；修改后需重新审核" action={<button className="button primary" onClick={() => setShow(true)}>＋ 新增节点</button>}>
+  return <Page title="我的节点" description="新增节点的后端、协议和配置项均由站长启用的后端仓库提供" action={<Link className="button primary" to="/admin/deploy">＋ 新增节点</Link>}>
     {token && <Notice tone="success"><strong>请立即保存节点令牌：</strong><code className="token">{token}</code><button className="link-button" onClick={() => navigator.clipboard.writeText(token)}>复制</button>。关闭后无法再次查看。</Notice>}
     <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>协议</th><th>状态</th><th>在线</th><th>最后心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => <tr key={node.id}><td><strong>{node.name}</strong><small className="cell-sub">{node.config.server}:{node.config.port}</small></td><td className="upper">{node.protocol}</td><td><Badge value={node.status} /></td><td>{node.online_count}</td><td>{date(node.last_seen_at)}</td><td><button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button></td></tr>)}</tbody></table>{!nodes.length && <Empty>还没有节点</Empty>}</section>
-    {show && <div className="modal-layer"><form className="modal" onSubmit={save}><button type="button" className="modal-close" onClick={() => setShow(false)}>×</button><p className="eyebrow">节点配置</p><h2>新增节点</h2><div className="form-grid"><Field label="名称"><input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field><Field label="协议"><select value={form.protocol} onChange={(e) => setForm({ name: form.name, protocol: e.target.value, server: form.server, port: form.port, tls: true, transport: "tcp" })}>{Object.keys(protocolFields).map((value) => <option key={value}>{value}</option>)}</select></Field><Field label="服务器"><input required value={form.server} onChange={(e) => setForm({ ...form, server: e.target.value })} /></Field><Field label="端口"><input type="number" min="1" max="65535" required value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} /></Field>{protocolFields[form.protocol].map(([key, label, placeholder]) => <Field label={label} key={key}><input value={form[key] ?? placeholder ?? ""} onChange={(e) => setForm({ ...form, [key]: e.target.value })} /></Field>)}</div><label className="check"><input type="checkbox" checked={Boolean(form.tls)} onChange={(e) => setForm({ ...form, tls: e.target.checked })} /> 启用 TLS</label>{error && <Notice tone="danger">{error}</Notice>}<div className="modal-actions"><button type="button" className="button" onClick={() => setShow(false)}>取消</button><button className="button primary">保存并提交审核</button></div></form></div>}
   </Page>;
 }
 
-function AdminDeploy() {
+function NodeDeploy({ returnTo }: { returnTo: string }) {
   const [presets, setPresets] = useState<Json[] | null>(null);
-  const [selectedKey, setSelectedKey] = useState("");
+  const [backendId, setBackendId] = useState("");
+  const [presetId, setPresetId] = useState("");
   const [name, setName] = useState("");
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [command, setCommand] = useState("");
   const [expiresAt, setExpiresAt] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  useEffect(() => { api<{ presets: Json[] }>("/api/admin/node-presets").then((result) => { setPresets(result.presets); if (result.presets[0]) setSelectedKey(`${result.presets[0].backend_repository_id}:${result.presets[0].preset_id}`); }).catch((reason) => { setError(reason.message); setPresets([]); }); }, []);
-  const selected = presets?.find((preset) => `${preset.backend_repository_id}:${preset.preset_id}` === selectedKey);
-  useEffect(() => { setInputs({}); setCommand(""); }, [selectedKey]);
+  useEffect(() => { api<{ presets: Json[] }>("/api/deploy/presets").then((result) => { setPresets(result.presets); if (result.presets[0]) { setBackendId(result.presets[0].backend_id); setPresetId(result.presets[0].preset_id); } }).catch((reason) => { setError(reason.message); setPresets([]); }); }, []);
+  const backends = Array.from(new Map((presets || []).map((preset) => [preset.backend_id, { id: preset.backend_id, name: preset.backend_name, version: preset.backend_version }])).values());
+  const backendPresets = (presets || []).filter((preset) => preset.backend_id === backendId);
+  const selected = backendPresets.find((preset) => preset.preset_id === presetId);
+  useEffect(() => {
+    if (backendPresets.length && !backendPresets.some((preset) => preset.preset_id === presetId)) setPresetId(backendPresets[0].preset_id);
+  }, [backendId, presets]);
+  useEffect(() => { setInputs(Object.fromEntries((selected?.inputs || []).map((field: Json) => [field.key, field.type === "checkbox" ? field.default || "false" : field.default || ""]))); setCommand(""); }, [selected?.backend_repository_id, selected?.preset_id]);
+  const visibleInputs = (selected?.inputs || []).filter((field: Json) => !field.when || (inputs[field.when.key] || "") === field.when.equals);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!selected) return;
     setBusy(true); setError(""); setCommand("");
     try {
-      const created = await api<Json>("/api/admin/nodes/from-preset", { method: "POST", body: JSON.stringify({ backendId: selected.backend_id, presetId: selected.preset_id, name, inputs }) });
-      const installed = await api<Json>(`/api/admin/nodes/${created.node.id}/install-command`, { method: "POST", body: "{}" });
+      const created = await api<Json>("/api/deploy/nodes", { method: "POST", body: JSON.stringify({ backendId: selected.backend_id, presetId: selected.preset_id, name, inputs }) });
+      const installed = await api<Json>(`/api/deploy/nodes/${created.node.id}/install-command`, { method: "POST", body: JSON.stringify({ inputs }) });
       setCommand(installed.command); setExpiresAt(installed.expiresAt);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "创建安装命令失败"); }
     finally { setBusy(false); }
   };
   if (!presets) return <Loading />;
-  return <Page title="节点一键部署" description="用户与配额始终由 BoardLess 下发；这里只安装节点 Agent 和代理服务">
+  return <Page title="新增节点" description="选择后端后，配置项由该后端仓库的 README 清单提供" action={<Link className="button" to={returnTo}>返回节点列表</Link>}>
     {error && <Notice tone="danger">{error}</Notice>}
     {!presets.length ? <section className="panel"><Empty>暂无已启用后端，请联系站长先导入并确认后端仓库</Empty></section> : <div className="two-column">
       <form className="panel form-stack" onSubmit={submit}>
-        <h2>选择后端预设</h2>
-        <Field label="配置预设"><select value={selectedKey} onChange={(event) => setSelectedKey(event.target.value)}>{presets.map((preset) => <option key={`${preset.backend_repository_id}:${preset.preset_id}`} value={`${preset.backend_repository_id}:${preset.preset_id}`}>{preset.backend_name} · {preset.name}</option>)}</select></Field>
+        <h2>后端与配置</h2>
+        <Field label="节点后端"><select value={backendId} onChange={(event) => setBackendId(event.target.value)}>{backends.map((backend) => <option key={backend.id} value={backend.id}>{backend.name} · {backend.version}</option>)}</select></Field>
+        <Field label="配置方案"><select value={presetId} onChange={(event) => setPresetId(event.target.value)}>{backendPresets.map((preset) => <option key={preset.preset_id} value={preset.preset_id}>{preset.name} · {String(preset.protocol).toUpperCase()}</option>)}</select></Field>
         {selected && <Notice>{selected.description || `${selected.protocol} 节点预设`}<br />固定提交：<code>{String(selected.commit_sha).slice(0, 12)}</code>{selected.generatedOutputs.length ? `；安装时生成 ${selected.generatedOutputs.join("、")}` : ""}</Notice>}
         <Field label="节点名称"><input required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：香港 01" /></Field>
-        {selected?.requiredInputs.map((key: string) => <Field key={key} label={key}><input required maxLength={512} value={inputs[key] || ""} onChange={(event) => setInputs({ ...inputs, [key]: event.target.value })} /></Field>)}
+        {visibleInputs.map((field: Json) => field.type === "checkbox" ? <label className="check backend-toggle" key={field.key}><input type="checkbox" checked={inputs[field.key] === "true"} onChange={(event) => setInputs({ ...inputs, [field.key]: event.target.checked ? "true" : "false" })} /><span><strong>{field.label}</strong>{field.help && <small>{field.help}</small>}</span></label> : <Field key={field.key} label={field.label} hint={field.help}>{field.type === "select" ? <select required={field.required !== false} value={inputs[field.key] || ""} onChange={(event) => setInputs({ ...inputs, [field.key]: event.target.value })}><option value="" disabled>请选择</option>{field.options.map((option: Json) => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : <input required={field.required !== false} type={field.type === "email" ? "email" : field.type === "number" ? "number" : field.type === "url" ? "url" : field.type === "password" ? "password" : "text"} maxLength={512} autoComplete={field.type === "password" ? "off" : undefined} placeholder={field.placeholder || ""} value={inputs[field.key] || ""} onChange={(event) => setInputs({ ...inputs, [field.key]: event.target.value })} />}</Field>)}
         <button className="button primary" disabled={busy}>{busy ? "正在生成…" : "创建节点并生成安装命令"}</button>
       </form>
       <section className="panel command-panel">
@@ -343,24 +332,15 @@ function OwnerDashboard() {
 
 function OwnerNodes() {
   const { user } = useAuth();
-  const [nodes, setNodes] = useState<Json[] | null>(null); const [show, setShow] = useState(false); const [token, setToken] = useState(""); const [error, setError] = useState("");
-  const [form, setForm] = useState<Json>({ name: "", protocol: "vless", server: "", port: "443", tls: true, transport: "tcp" });
+  const [nodes, setNodes] = useState<Json[] | null>(null); const [token, setToken] = useState("");
   const load = () => api<{ nodes: Json[] }>("/api/owner/nodes").then((r) => setNodes(r.nodes)); useEffect(() => { void load(); }, []);
-  const save = async (event: FormEvent) => {
-    event.preventDefault(); setError("");
-    const config: Json = { server: form.server, port: Number(form.port), tls: Boolean(form.tls), udp: true };
-    for (const [key] of protocolFields[form.protocol] || []) if (form[key] !== "" && form[key] !== undefined) config[key] = ["upMbps", "downMbps"].includes(key) ? Number(form[key]) : form[key];
-    try { const result = await api<Json>("/api/owner/nodes", { method: "POST", body: JSON.stringify({ name: form.name, protocol: form.protocol, config }) }); setToken(result.token); setShow(false); await load(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); }
-  };
   const action = async (id: string, value: "approve" | "suspend") => { await api(`/api/owner/nodes/${id}/action`, { method: "POST", body: JSON.stringify({ action: value }) }); await load(); };
   const rotate = async (id: string) => { if (!confirm("旧令牌会立即失效，继续吗？")) return; const result = await api<Json>(`/api/owner/nodes/${id}/rotate-token`, { method: "POST", body: "{}" }); setToken(result.token); };
   const archive = async (id: string) => { if (!confirm("归档后节点将从订阅和套餐中停止使用，继续吗？")) return; await api(`/api/owner/nodes/${id}`, { method: "PATCH", body: JSON.stringify({ archive: true }) }); await load(); };
   if (!nodes) return <Loading />;
-  return <Page title="节点管理" description="自营节点可直接维护；管理员节点仍由原管理员维护" action={<button className="button primary" onClick={() => setShow(true)}>＋ 新增节点</button>}>
+  return <Page title="节点管理" description="新增节点的后端、协议和配置项均由已启用的后端仓库提供" action={<Link className="button primary" to="/owner/deploy">＋ 新增节点</Link>}>
     {token && <Notice tone="success"><strong>请立即保存节点令牌：</strong><code className="token">{token}</code><button className="link-button" onClick={() => navigator.clipboard.writeText(token)}>复制</button>。关闭后无法再次查看。</Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>归属</th><th>协议</th><th>地址</th><th>状态</th><th>心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => { const own = node.owner_admin_id === user?.id; return <tr key={node.id}><td><strong>{node.name}</strong></td><td>{own ? "站长自营" : node.owner_email}</td><td className="upper">{node.protocol}</td><td className="mono">{node.config.server}:{node.config.port}</td><td><Badge value={node.status} /></td><td>{date(node.last_seen_at)}</td><td className="actions">{own ? <>{node.status !== "archived" && <button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button>}{node.status !== "archived" && <button className="link-button negative" onClick={() => archive(node.id)}>归档</button>}</> : <>{node.status !== "approved" && node.status !== "archived" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status === "approved" && <button className="link-button negative" onClick={() => action(node.id, "suspend")}>停用</button>}</>}</td></tr>; })}</tbody></table>{!nodes.length && <Empty>暂无节点</Empty>}</section>
-    {show && <div className="modal-layer"><form className="modal" onSubmit={save}><button type="button" className="modal-close" onClick={() => setShow(false)}>×</button><p className="eyebrow">站长自营节点</p><h2>新增节点</h2><div className="form-grid"><Field label="名称"><input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field><Field label="协议"><select value={form.protocol} onChange={(e) => setForm({ name: form.name, protocol: e.target.value, server: form.server, port: form.port, tls: true, transport: "tcp" })}>{Object.keys(protocolFields).map((value) => <option key={value}>{value}</option>)}</select></Field><Field label="服务器"><input required value={form.server} onChange={(e) => setForm({ ...form, server: e.target.value })} /></Field><Field label="端口"><input type="number" min="1" max="65535" required value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} /></Field>{protocolFields[form.protocol].map(([key, label, placeholder]) => <Field label={label} key={key}><input value={form[key] ?? placeholder ?? ""} onChange={(e) => setForm({ ...form, [key]: e.target.value })} /></Field>)}</div><label className="check"><input type="checkbox" checked={Boolean(form.tls)} onChange={(e) => setForm({ ...form, tls: e.target.checked })} /> 启用 TLS</label>{error && <Notice tone="danger">{error}</Notice>}<div className="modal-actions"><button type="button" className="button" onClick={() => setShow(false)}>取消</button><button className="button primary">保存并启用</button></div></form></div>}
+    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>归属</th><th>协议</th><th>地址</th><th>状态</th><th>心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => { const own = node.owner_admin_id === user?.id; return <tr key={node.id}><td><strong>{node.name}</strong></td><td>{own ? "站长自营" : node.owner_email}</td><td className="upper">{node.protocol}</td><td className="mono">{node.config.server}:{node.config.port}</td><td><Badge value={node.status} /></td><td>{date(node.last_seen_at)}</td><td className="actions">{own ? <>{node.status === "pending" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status !== "archived" && <button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button>}{node.status !== "archived" && <button className="link-button negative" onClick={() => archive(node.id)}>归档</button>}</> : <>{node.status !== "approved" && node.status !== "archived" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status === "approved" && <button className="link-button negative" onClick={() => action(node.id, "suspend")}>停用</button>}</>}</td></tr>; })}</tbody></table>{!nodes.length && <Empty>暂无节点</Empty>}</section>
   </Page>;
 }
 
@@ -501,8 +481,8 @@ function App() {
     <Route path="/" element={<Navigate to={user ? "/app" : "/login"} replace />} />
     <Route path="/login" element={<Login />} /><Route path="/admin/login" element={<Login admin />} /><Route path="/invite/:token" element={<Invite />} />
     <Route path="/app" element={<UserArea><UserDashboard /></UserArea>} /><Route path="/app/plans" element={<UserArea><Plans /></UserArea>} /><Route path="/app/subscription" element={<UserArea><Subscription /></UserArea>} /><Route path="/app/usage" element={<UserArea><Usage /></UserArea>} /><Route path="/app/orders" element={<UserArea><Orders /></UserArea>} />
-    <Route path="/admin" element={<AdminArea><AdminDashboard /></AdminArea>} /><Route path="/admin/nodes" element={<AdminArea><AdminNodes /></AdminArea>} /><Route path="/admin/deploy" element={<AdminArea><AdminDeploy /></AdminArea>} /><Route path="/admin/users" element={<AdminArea><AdminUsers /></AdminArea>} /><Route path="/admin/earnings" element={<AdminArea><AdminEarnings /></AdminArea>} />
-    <Route path="/owner" element={<OwnerArea><OwnerDashboard /></OwnerArea>} /><Route path="/owner/nodes" element={<OwnerArea><OwnerNodes /></OwnerArea>} /><Route path="/owner/backends" element={<OwnerArea><OwnerBackends /></OwnerArea>} /><Route path="/owner/plans" element={<OwnerArea><OwnerPlans /></OwnerArea>} /><Route path="/owner/users" element={<OwnerArea><OwnerUsers /></OwnerArea>} /><Route path="/owner/payments" element={<OwnerArea><OwnerPayments /></OwnerArea>} /><Route path="/owner/orders" element={<OwnerArea><OwnerOrders /></OwnerArea>} /><Route path="/owner/withdrawals" element={<OwnerArea><OwnerWithdrawals /></OwnerArea>} /><Route path="/owner/audit" element={<OwnerArea><OwnerAudit /></OwnerArea>} />
+    <Route path="/admin" element={<AdminArea><AdminDashboard /></AdminArea>} /><Route path="/admin/nodes" element={<AdminArea><AdminNodes /></AdminArea>} /><Route path="/admin/deploy" element={<AdminArea><NodeDeploy returnTo="/admin/nodes" /></AdminArea>} /><Route path="/admin/users" element={<AdminArea><AdminUsers /></AdminArea>} /><Route path="/admin/earnings" element={<AdminArea><AdminEarnings /></AdminArea>} />
+    <Route path="/owner" element={<OwnerArea><OwnerDashboard /></OwnerArea>} /><Route path="/owner/nodes" element={<OwnerArea><OwnerNodes /></OwnerArea>} /><Route path="/owner/deploy" element={<OwnerArea><NodeDeploy returnTo="/owner/nodes" /></OwnerArea>} /><Route path="/owner/backends" element={<OwnerArea><OwnerBackends /></OwnerArea>} /><Route path="/owner/plans" element={<OwnerArea><OwnerPlans /></OwnerArea>} /><Route path="/owner/users" element={<OwnerArea><OwnerUsers /></OwnerArea>} /><Route path="/owner/payments" element={<OwnerArea><OwnerPayments /></OwnerArea>} /><Route path="/owner/orders" element={<OwnerArea><OwnerOrders /></OwnerArea>} /><Route path="/owner/withdrawals" element={<OwnerArea><OwnerWithdrawals /></OwnerArea>} /><Route path="/owner/audit" element={<OwnerArea><OwnerAudit /></OwnerArea>} />
     <Route path="*" element={<NotFound />} />
   </Routes>;
 }

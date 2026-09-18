@@ -1,0 +1,13 @@
+services:
+  boardless:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.docker
+    volumes:
+      - boardless-data:/data
+    restart: unless-stopped
+
+volumes:
+  boardless-data:

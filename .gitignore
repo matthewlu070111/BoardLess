@@ -1,0 +1,47 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local environment and production secrets
+.env
+.env.*
+!.env.example
+!.env.docker.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.cloudflare.secrets.json
+
+# Cloudflare and local runtime state
+.wrangler/
+.sites-runtime/
+
+# Panel installer output (when the repository itself is used as install-dir)
+/.install.env
+/compose.install.yml
+/Caddyfile
+/boardlessctl
+/data/
+/backups/
+
+# SQLite runtime files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

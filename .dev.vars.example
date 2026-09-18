@@ -1,0 +1,5 @@
+SESSION_SECRET="replace-with-at-least-32-random-bytes"
+BOOTSTRAP_SECRET="replace-with-a-one-time-bootstrap-secret"
+ALIPAY_APP_ID="your-alipay-app-id"
+ALIPAY_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..."
+ALIPAY_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----..."

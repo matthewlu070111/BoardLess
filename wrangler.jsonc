@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "boardless",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-08-04",
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/sub/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "boardless",
+      "database_id": "replace-with-your-d1-database-id",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": { "crons": ["17 2 * * *"] },
+  "vars": {
+    "APP_ORIGIN": "http://localhost:5173",
+    "ALIPAY_GATEWAY": "https://openapi.alipaydev.com/gateway.do"
+  },
+  "secrets": {
+    "required": [
+      "SESSION_SECRET",
+      "BOOTSTRAP_SECRET",
+      "ALIPAY_APP_ID",
+      "ALIPAY_PRIVATE_KEY",
+      "ALIPAY_PUBLIC_KEY"
+    ]
+  }
+}

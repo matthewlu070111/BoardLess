@@ -95,6 +95,7 @@ git remote add upstream https://github.com/matthewlu070111/BoardLess.git
 git fetch upstream
 git checkout main
 git read-tree --reset -u upstream/main
+git checkout HEAD -- .github/workflows wrangler.jsonc
 git rev-parse upstream/main > .boardless-upstream-commit
 git add --all
 git commit -m "Update BoardLess from upstream"
@@ -103,7 +104,12 @@ git push origin main
 
 同步采用完整快照替换，不依赖两个仓库是否拥有共同 Git 历史。它会删除仓库副本中仅本地存在的受跟踪文件，并覆盖所有受跟踪文件的本地修改；执行前应先备份需要保留的定制内容。`.boardless-upstream-commit` 记录本次使用的上游 commit，供自动检查判断是否已有新版本。
 
-GitHub 不允许仓库自带的 `GITHUB_TOKEN` 新增或修改 `.github/workflows/` 中的文件，因此自动同步会把该目录恢复为仓库副本同步前的版本，不将其纳入覆盖。如果 Actions 日志提示上游工作流有变化，需要站长像首次启用时一样手动复制并提交新版工作流。除此目录外，其余受跟踪文件仍会全量覆盖。
+自动同步会保留两类部署专用内容：
+
+- `.github/workflows/`：GitHub 不允许仓库自带的 `GITHUB_TOKEN` 新增或修改工作流文件。如果 Actions 日志提示上游工作流有变化，需要站长像首次启用时一样手动复制并提交新版工作流。
+- `wrangler.jsonc`：Cloudflare 在该文件中写入真实的 D1 `database_id`、Worker 名称和生产变量。用上游模板覆盖它会把 D1 ID 恢复成占位符，导致后续部署失败。上游若调整 Wrangler 配置结构，需要站长手动把结构变化合入部署仓库现有配置。
+
+除这两类内容外，其余受跟踪文件仍会全量覆盖。工作流还会检查保留下来的 `wrangler.jsonc`；如果其中仍是 D1 占位符，会在创建更新 PR 前停止。
 
 最后的 `git push` 会自动触发 Workers Builds。如果仓库副本中有自定义修改，应在覆盖前单独备份，并在推送前完成测试。
 
@@ -130,14 +136,14 @@ Deploy to Cloudflare 创建仓库副本后，在该仓库中完成以下设置�
 
    提交后 GitHub 才会开始定时运行；不取消注释就会一直保持纯手动模式。
 
-工作流不需要额外创建 Personal Access Token，使用仓库自动提供的 `GITHUB_TOKEN`，权限仅限写入更新分支和创建 Pull Request。工作流读取 `.boardless-upstream-commit` 并与最新上游 commit 比较；记录不存在或 commit 不同时，都会用最新上游替换受跟踪文件并更新记录，同时保留目标仓库现有的 `.github/workflows/`。发现更新后：
+工作流不需要额外创建 Personal Access Token，使用仓库自动提供的 `GITHUB_TOKEN`，权限仅限写入更新分支和创建 Pull Request。工作流读取 `.boardless-upstream-commit` 并与最新上游 commit 比较；记录不存在或 commit 不同时，都会用最新上游替换受跟踪文件并更新记录，同时保留目标仓库现有的 `.github/workflows/` 和 `wrangler.jsonc`。发现更新后：
 
 1. 打开机器人创建的 **Update BoardLess from upstream** Pull Request。
 2. 检查完整文件差异和测试结果，确认可以删除仓库副本中的受跟踪定制内容。
 3. 确认无误后合并 Pull Request。
 4. 合并产生的 `main` 分支 push 会触发 Cloudflare Workers Builds，自动执行 `npm run deploy`。
 
-完整快照替换不会产生 Git 合并冲突，但合并 Pull Request 后会覆盖 `.github/workflows/` 之外所有受跟踪的本地修改。要修改检查频率，可调整 `schedule` 中的 cron 表达式；要关闭自动检查，重新注释或删除 `schedule`，保留 `workflow_dispatch` 即可。
+快照替换不会产生 Git 合并冲突，但合并 Pull Request 后会覆盖 `.github/workflows/` 和 `wrangler.jsonc` 之外所有受跟踪的本地修改。要修改检查频率，可调整 `schedule` 中的 cron 表达式；要关闭自动检查，重新注释或删除 `schedule`，保留 `workflow_dispatch` 即可。
 
 模板还包含源仓库保护条件：当仓库本身是 `matthewlu070111/BoardLess` 时，同步任务会直接跳过，避免源仓库反向同步自身。自动检查仍然默认关闭，是否启用完全由部署者决定。
 

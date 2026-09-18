@@ -919,7 +919,7 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 3. 服务端合并预设和管理员输入，浏览器不能自行生成最终配置
 4. 没有 `generatedOutputs` 时直接执行现有 `validateNodeConfig`
 5. 存在安装阶段输出时，先校验已知字段并保持节点为 `pending`
-6. BoardLess 为该节点签发 5 分钟内单次有效的安装令牌
+6. BoardLess 为该节点签发 30 分钟内单次有效的安装令牌
 7. 目标服务器安装脚本生成 Reality 密钥等本机数据
 8. Agent 通过 `/api/node/v1/bootstrap` 提交公钥等 `generatedOutputs` 并兑换正式节点令牌
 9. BoardLess 合并公开输出并执行完整 `validateNodeConfig`
@@ -934,7 +934,7 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `--panel-url` | 是 | BoardLess 的公开 HTTPS 地址 |
-| `--install-token` | 是 | 5 分钟内单次有效的节点安装令牌 |
+| `--install-token` | 是 | 30 分钟内单次有效的节点安装令牌 |
 | `--preset` | 是 | 已选 README 预设 ID |
 | `--agent-version` | 否 | 固定安装的 Agent 版本 |
 | `--install-dir` | 否 | 安装目录 |

@@ -49,8 +49,10 @@ describe("node installation bootstrap", () => {
     expect(result.command).toContain("'--mode' 'both'");
     expect(result.command).toContain("'--vps-panel-url' 'https://vps.example.com'");
     expect(result.command).toContain("'--vps-enrollment-token' 'one-time-secret'");
-    const saved = await db.prepare("SELECT inputs_json FROM node_install_tokens WHERE node_id = ?").bind(created.node.id).first<{ inputs_json: string }>();
+    const saved = await db.prepare("SELECT inputs_json, expires_at, created_at FROM node_install_tokens WHERE node_id = ?").bind(created.node.id)
+      .first<{ inputs_json: string; expires_at: number; created_at: number }>();
     expect(JSON.parse(saved!.inputs_json)).toEqual({ server: "node.example.com", enableVps: "true", vpsUrl: "https://vps.example.com" });
+    expect(saved!.expires_at - saved!.created_at).toBe(30 * 60);
     const node = await db.prepare("SELECT backend_inputs_json FROM nodes WHERE id = ?").bind(created.node.id).first<{ backend_inputs_json: string }>();
     expect(JSON.parse(node!.backend_inputs_json).vpsToken).toBe("");
     database.close();
@@ -84,7 +86,13 @@ describe("node installation bootstrap", () => {
     const result = await response.json() as { nodeToken: string; config: Record<string, unknown> };
     expect(result.nodeToken).toBeTruthy();
     expect(result.config.realityPublicKey).toBe("public-key");
-    expect((await request()).status).toBe(401);
+    const reusedResponse = await request();
+    expect(reusedResponse.status).toBe(401);
+    expect(await reusedResponse.json()).toEqual({ error: "安装令牌已被使用，请重新生成安装命令" });
+    await db.prepare("UPDATE node_install_tokens SET used_at = NULL, expires_at = ? WHERE id = 'install_1'").bind(timestamp - 1).run();
+    const expiredResponse = await request();
+    expect(expiredResponse.status).toBe(401);
+    expect(await expiredResponse.json()).toEqual({ error: "安装令牌已过期，请重新生成安装命令" });
     const configResponse = await app.request("http://localhost/api/node/v1/config", { headers: { Authorization: `Bearer ${result.nodeToken}` } }, env);
     expect(configResponse.status).toBe(200);
     expect((await configResponse.json() as { users: unknown[] }).users).toEqual([]);

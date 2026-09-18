@@ -16,6 +16,7 @@ export const app = new Hono<App>();
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const protocols = new Set<Protocol>(["shadowsocks", "vmess", "vless", "trojan", "hysteria2", "tuic"]);
+const nodeInstallTokenTtlSeconds = 30 * 60;
 
 app.use("/api/*", cors({ origin: (origin, c) => origin === c.env.APP_ORIGIN ? origin : c.env.APP_ORIGIN, credentials: true }));
 
@@ -562,7 +563,7 @@ async function createNodeInstallCommand(c: Context<App>) {
   ).bind(c.req.param("id"), user.id).first<Record<string, unknown>>();
   if (!row || row.status !== "enabled") return c.json({ error: "节点不存在、状态无效或后端未启用" }, 404);
   const token = randomToken(32);
-  const expiresAt = now() + 300;
+  const expiresAt = now() + nodeInstallTokenTtlSeconds;
   const storedValues = JSON.parse(String(row.backend_inputs_json || "{}")) as Record<string, string>;
   const inputDefinitions = parseBackendInputs(String(row.required_inputs_json));
   const request = await body<{ inputs?: Record<string, unknown> }>(c);
@@ -607,14 +608,21 @@ app.post("/api/node/v1/bootstrap", async (c) => {
   const installToken = String(input.installToken || "");
   if (!installToken) return c.json({ error: "安装令牌不能为空" }, 400);
   const row = await c.env.DB.prepare(
-    `SELECT t.id AS install_id, t.node_id, t.expires_at, t.used_at, n.config_json AS node_config_json, p.generated_outputs_json, n.status
+    `SELECT t.id AS install_id, t.node_id, t.expires_at, t.used_at, n.config_json AS node_config_json,
+       p.generated_outputs_json, n.status AS node_status, b.status AS backend_status
      FROM node_install_tokens t
-     JOIN backend_presets p ON p.backend_repository_id = t.backend_repository_id AND p.preset_id = t.preset_id
-     JOIN backend_repositories b ON b.id = t.backend_repository_id
-     JOIN nodes n ON n.id = t.node_id
-     WHERE t.token_hash = ? AND b.status = 'enabled'`,
+     LEFT JOIN backend_presets p ON p.backend_repository_id = t.backend_repository_id AND p.preset_id = t.preset_id
+     LEFT JOIN backend_repositories b ON b.id = t.backend_repository_id
+     LEFT JOIN nodes n ON n.id = t.node_id
+     WHERE t.token_hash = ?`,
   ).bind(await sha256(installToken)).first<Record<string, unknown>>();
-  if (!row || row.used_at || Number(row.expires_at) <= now() || row.status !== "pending") return c.json({ error: "安装令牌无效、已使用或已过期" }, 401);
+  if (!row) return c.json({ error: "安装令牌无效" }, 401);
+  if (row.used_at) return c.json({ error: "安装令牌已被使用，请重新生成安装命令" }, 401);
+  if (Number(row.expires_at) <= now()) return c.json({ error: "安装令牌已过期，请重新生成安装命令" }, 401);
+  if (row.node_status !== "pending") return c.json({ error: "节点状态已发生变化，请重新创建或检查节点" }, 409);
+  if (row.backend_status !== "enabled" || row.node_config_json == null || row.generated_outputs_json == null) {
+    return c.json({ error: "节点后端或预设不可用，请检查后端状态后重新生成安装命令" }, 409);
+  }
   const allowed = parseStringArray(String(row.generated_outputs_json));
   const supplied = input.generatedOutputs || {};
   if (!supplied || typeof supplied !== "object" || Array.isArray(supplied) || Object.keys(supplied).some((key) => !allowed.includes(key))) {

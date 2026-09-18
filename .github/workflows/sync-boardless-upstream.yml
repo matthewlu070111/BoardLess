@@ -46,6 +46,11 @@ jobs:
           git fetch --no-tags boardless-upstream "${UPSTREAM_BRANCH}"
           git checkout -B "${UPDATE_BRANCH}" "origin/${TARGET_BRANCH}"
 
+          if [[ ! -f wrangler.jsonc ]] || grep -q 'replace-with-your-d1-database-id' wrangler.jsonc; then
+            echo "::error::The deployed wrangler.jsonc does not contain a real D1 database ID. Restore the Cloudflare-generated wrangler.jsonc before synchronizing."
+            exit 1
+          fi
+
           latest_upstream_commit="$(git rev-parse "boardless-upstream/${UPSTREAM_BRANCH}")"
           previous_upstream_commit=""
           if [[ -f "${UPSTREAM_STATE_FILE}" ]]; then
@@ -58,10 +63,10 @@ jobs:
             exit 0
           fi
 
-          # Replace the complete tracked tree. GitHub does not allow the
-          # repository GITHUB_TOKEN to create or update workflow files, so keep
-          # the deployed repository's workflow directory as the sole exception.
-          # Upstream workflow changes must be copied manually.
+          # Replace the tracked source tree while preserving deployment state.
+          # GitHub does not allow GITHUB_TOKEN to update workflow files, and
+          # wrangler.jsonc contains the deployed Worker's real D1 database ID,
+          # name, and production variables.
           git read-tree --reset -u "boardless-upstream/${UPSTREAM_BRANCH}"
           if ! git diff --quiet \
             "origin/${TARGET_BRANCH}" \
@@ -71,6 +76,7 @@ jobs:
           fi
           git rm -r --force --quiet --ignore-unmatch .github/workflows
           git checkout "origin/${TARGET_BRANCH}" -- .github/workflows
+          git checkout "origin/${TARGET_BRANCH}" -- wrangler.jsonc
 
           printf '%s\n' "${latest_upstream_commit}" > "${UPSTREAM_STATE_FILE}"
           git add --all
@@ -103,4 +109,4 @@ jobs:
             --base "${TARGET_BRANCH}" \
             --head "${UPDATE_BRANCH}" \
             --title "Update BoardLess from upstream" \
-            --body $'This pull request replaces the tracked repository snapshot with the latest `matthewlu070111/BoardLess` upstream commit. `.github/workflows/` is preserved because GitHub does not permit `GITHUB_TOKEN` to update workflow files.\n\nOther downstream-only tracked files and modifications will be removed. Review the full diff and checks before merging. Merging into the production branch will trigger Cloudflare Workers Builds.'
+            --body $'This pull request replaces the tracked source snapshot with the latest `matthewlu070111/BoardLess` upstream commit. `.github/workflows/` and the deployment-specific `wrangler.jsonc` are preserved.\n\nOther downstream-only tracked files and modifications will be removed. Review the full diff and checks before merging. Merging into the production branch will trigger Cloudflare Workers Builds.'

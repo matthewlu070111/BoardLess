@@ -8,12 +8,18 @@ BoardLess 是一个轻量的订阅与节点管理面板，提供用户中心、�
 
 - 用户：查看套餐与流量、支付宝扫码购买、续费或升级、获取和轮换订阅链接
 - 管理员：维护自己的节点、邀请用户、查看销售收益并发起提现
-- 站长：审核节点、管理套餐与账号、处理提现、查看订单和审计日志
+- 站长：审核节点、管理套餐与账号、配置支付方式、处理提现、查看订单和审计日志
 - 节点：拉取授权用户与协议配置，上报心跳和增量流量
 - 后端仓库：导入兼容 GitHub 仓库，校验 README 特征码与脚本哈希，通过预设生成一次性节点安装命令
 - 订阅：输出 Clash、sing-box、Surge 和 Base64 通用订阅
 - 协议：Shadowsocks、VMess、VLESS、Trojan、Hysteria 2、TUIC
-- 支付：支付宝当面付，支持异步通知、主动查询和重复回调幂等处理
+- 支付：站长后台配置支付宝当面付，支持异步通知、主动查询和重复回调幂等处理
+
+## 推荐后端
+
+| 后端 | 简介 | 支持的预设 |
+| --- | --- | --- |
+| [matthewlu070111/BoardRay](https://github.com/matthewlu070111/BoardRay) | 由 Xray 驱动的节点 Agent，可接入 BoardLess，并安全地拉取用户、应用配置和上报流量。 | VLESS + TCP + TLS + XTLS Vision；VLESS + TCP/RAW + REALITY + XTLS Vision |
 
 ## 技术栈
 
@@ -58,9 +64,72 @@ wget -qO /tmp/boardless-install.sh 'https://raw.githubusercontent.com/matthewlu0
 
 点击按钮后登录 Cloudflare，确认 Worker、D1 和 Secrets 配置即可部署。Cloudflare 会复制公开仓库、创建并绑定 D1、执行迁移，然后构建发布 Worker。部署完成后，将 `APP_ORIGIN` 设置为 Worker 的最终 HTTPS 地址，并使用 `BOOTSTRAP_SECRET` 创建首次站长账号。
 
-需要绑定自定义域名、交互配置支付宝或由脚本自动创建站长账号时，可下载 [`deploy-cloudflare.sh`](https://raw.githubusercontent.com/matthewlu070111/BoardLess/refs/heads/main/scripts/deploy-cloudflare.sh) 后运行。
+部署完成后，创建站长账号：
+```bash
+curl -X POST 'https://boardless.xxxxx.workers.dev/api/setup/bootstrap' \
+  -H 'content-type: application/json' \
+  -H 'origin: https://boardless.xxxxx.workers.dev' \
+  -d '{
+    "secret":"你的BOOTSTRAP_SECRET",
+    "email":"admin@example.com",
+    "password":"10位以上的密码"
+  }'
+```
 
-部署完成后访问 `/admin/login`。建议按“邀请管理员 → 添加并审核节点 → 创建套餐 → 邀请用户”的顺序完成初始配置。
+## 更新与回滚
+
+Linux 自托管安装建议使用稳定版本标签（例如 `v0.2.0`）或提交 SHA。Cloudflare 部署由 Workers Builds 持续监听 BoardLess 原始仓库的生产分支，并在该分支收到新 commit 后自动构建和部署。
+
+### Cloudflare 更新
+
+Deploy to Cloudflare 完成首次部署后，Workers Builds 会持续跟踪 BoardLess 原始仓库的生产分支（默认是 `main`）。原始仓库出现新 commit 时，Cloudflare 会自动读取该 commit、执行部署命令并发布新版本；站长无需手工同步仓库、拉取代码或再次运行一键部署脚本。
+
+本项目在 `package.json` 中定义的 Cloudflare 部署命令为：
+
+```bash
+npm run deploy
+```
+
+该命令会依次构建项目、对绑定为 `DB` 的远程 D1 执行尚未应用的 migration，然后部署 Worker。Cloudflare 部署按钮会识别这个自定义 `deploy` 脚本并预填到 Workers Builds；可在 Cloudflare 控制台的 **Settings → Builds** 中确认 Deploy command 是 `npm run deploy`。如果被改成单独的 `npx wrangler deploy`，代码仍会更新，但新的 D1 migration 不会自动执行。
+
+通过 Workers Builds 更新时会继续使用 Worker 中已有的变量、Secrets 和 D1 绑定，不会重新生成 `SESSION_SECRET`，也不会清空用户、订单、节点或支付配置。`wrangler d1 migrations apply` 在应用 migration 时会创建 D1 备份；重要更新前仍建议使用 D1 Time Travel 或额外导出数据库。
+
+回滚代码时，可以在仓库中 revert 对应 commit 并推送到生产分支，让 Workers Builds 自动重新部署。已应用的 D1 migration 不会随代码 commit 自动回滚，需要回退数据库时应使用 D1 备份或 Time Travel 单独处理。
+
+仓库中的 `scripts/deploy-cloudflare.sh` 主要用于本地 CLI 手动部署。只有采用这种方式时，才依赖本地 `.cloudflare.secrets.json` 来保持重复部署时的密钥不变；通过部署按钮和 Workers Builds 自动更新不需要运行该脚本。
+
+### Linux 一键安装更新
+
+重新下载最新安装脚本，并使用原来的域名、安装目录和数据目录执行。下面示例更新到 `v0.2.0`：
+
+```bash
+curl -fsSL \
+  'https://raw.githubusercontent.com/matthewlu070111/BoardLess/refs/heads/main/scripts/install-panel.sh' \
+  -o /tmp/boardless-update.sh
+
+sudo bash /tmp/boardless-update.sh \
+  --repository 'https://github.com/matthewlu070111/BoardLess.git' \
+  --version 'v0.2.0' \
+  --domain 'panel.example.com' \
+  --install-dir '/opt/boardless' \
+  --data-dir '/var/lib/boardless' \
+  --with-caddy \
+  --skip-bootstrap \
+  --unattended
+```
+
+如果首次安装没有使用 Caddy，应去掉 `--with-caddy`，并按需继续传入原来的 `--listen-port`。`--version` 也可以填写确定的提交 SHA。
+
+脚本检测到已有的 `compose.install.yml` 后会执行安全升级：停止 BoardLess 容器，将 SQLite 复制到数据目录下的 `backups/`，保留原有 `.env.docker` 和密钥，覆盖程序文件，重新构建镜像并启动服务。容器启动时会自动执行尚未应用的 SQLite migration，随后脚本会等待健康检查通过。
+
+升级失败时可通过以下命令查看日志：
+
+```bash
+sudo /opt/boardless/boardlessctl status
+sudo /opt/boardless/boardlessctl logs --tail 200 boardless
+```
+
+需要回滚时，应重新运行安装脚本安装原来的版本标签或提交 SHA，并在停止服务后恢复 `/var/lib/boardless/backups/` 中对应的 SQLite 备份。恢复数据库会覆盖升级后的数据，执行前应额外保留当前数据库副本。
 
 ## 本地开发
 
@@ -113,10 +182,10 @@ curl -X POST http://localhost:5173/api/setup/bootstrap \
 | `APP_ORIGIN` | 是 | 面板的完整公开来源，例如 `https://panel.example.com`，不要带末尾斜杠 |
 | `SESSION_SECRET` | 是 | 会话与订阅令牌签名密钥，建议使用至少 32 字节的随机值 |
 | `BOOTSTRAP_SECRET` | 是 | 首次创建站长账号时使用的单次密钥 |
-| `ALIPAY_APP_ID` | 支付时 | 支付宝应用 ID |
-| `ALIPAY_PRIVATE_KEY` | 支付时 | 应用私钥，PKCS#8 PEM 格式 |
-| `ALIPAY_PUBLIC_KEY` | 支付时 | 支付宝公钥，PEM 格式 |
-| `ALIPAY_GATEWAY` | 否 | 支付宝网关；本地默认沙箱，生产环境使用正式网关 |
+| `ALIPAY_APP_ID` | 后台未配置支付时 | 支付宝应用 ID，作为站长后台配置的兼容回退 |
+| `ALIPAY_PRIVATE_KEY` | 后台未配置支付时 | 应用私钥，PKCS#8 PEM 格式，作为兼容回退 |
+| `ALIPAY_PUBLIC_KEY` | 后台未配置支付时 | 支付宝公钥，PEM 格式，作为兼容回退 |
+| `ALIPAY_GATEWAY` | 否 | 回退配置使用的支付宝网关；本地默认沙箱，生产环境使用正式网关 |
 
 Docker 模式还支持以下可选变量：
 
@@ -183,13 +252,21 @@ docker compose up -d --build
 - 不要将 `.env.docker`、私钥或数据库文件提交到版本库
 - 升级前先备份数据库，再重新构建镜像
 
-## 支付宝配置
+## 支付方式配置
+
+站长登录后可在“支付对接”页面填写支付宝应用 ID、应用私钥、支付宝公钥和网关地址，并随时启用或停用该渠道。支付凭据使用 `SESSION_SECRET` 派生的密钥加密后存入数据库，API 不会向浏览器回显私钥；更换 `SESSION_SECRET` 后需要重新保存支付凭据。
+
+部署环境中的 `ALIPAY_*` 变量保留为兼容回退：后台尚未保存支付宝配置时，系统继续读取环境变量；一旦站长在后台保存配置，新订单就使用数据库中的配置。当前内置适配器为支付宝当面付，微信支付、Stripe 等渠道仍需实现对应的签名、下单、回调和查单适配器后才能启用。
+
+### 支付宝
 
 支付宝应用需开通“当面付”。BoardLess 发起的异步通知地址为：
 
 ```text
 https://你的域名/api/payments/alipay/notify
 ```
+
+通过站长后台保存的配置会使用带支付方式 ID 的通知地址，具体地址由系统创建订单时自动提交给支付宝，无需手工拼接。
 
 建议先使用沙箱完成以下验证，再切换正式网关：
 

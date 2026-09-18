@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { audit, earningsBalance, monthKey, newId, now, randomToken, sha256, walletBalance } from "./db";
 import {
@@ -6,7 +6,7 @@ import {
   signSubscriptionToken, verifyPassword, verifySubscriptionToken,
 } from "./auth";
 import { closeEntitlement, proratedCredit, settleExpiredEntitlements, settleNodePool } from "./finance";
-import { createAlipayQr, queryAlipayOrder, verifyAlipayNotification } from "./payment";
+import { createAlipayQr, openPaymentSecrets, queryAlipayOrder, resolveAlipayConfig, sealPaymentSecrets, verifyAlipayNotification } from "./payment";
 import { renderSubscription, validateNodeConfig } from "./protocols";
 import type { AppVariables, Env, NodeRow, PlanRow, Protocol, Role } from "./types";
 import { importBackendRepository, renderPresetConfig, type BackendPreset, type ImportedBackend } from "./backends";
@@ -177,6 +177,7 @@ interface OrderRecord {
   id: string; user_id: string; plan_id: string; status: string; price_cents: number; wallet_cents: number; cash_cents: number;
   upgrade_credit_cents: number; upgrade_from_entitlement_id: string | null; expires_at: number; entitlement_id: string | null;
   duration_days: number; quota_bytes: number; node_pool_bps: number;
+  payment_method_id: string | null; payment_provider: string | null;
 }
 
 interface EntitlementRecord {
@@ -230,8 +231,8 @@ async function activateOrder(env: Env, orderId: string, tradeNo: string | null) 
     `INSERT INTO entitlements (id, user_id, plan_id, order_id, starts_at, ends_at, original_seconds, price_cents, quota_bytes, node_pool_bps, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
   ).bind(entitlementId, order.user_id, plan.id, order.id, startsAt, endsAt, order.duration_days * 86400, order.price_cents, order.quota_bytes, order.node_pool_bps));
-  statements.push(env.DB.prepare("UPDATE orders SET status = 'paid', paid_at = ?, alipay_trade_no = COALESCE(?, alipay_trade_no), entitlement_id = ? WHERE id = ? AND status = 'pending'")
-    .bind(timestamp, tradeNo, entitlementId, order.id));
+  statements.push(env.DB.prepare("UPDATE orders SET status = 'paid', paid_at = ?, alipay_trade_no = CASE WHEN payment_provider IS NULL OR payment_provider = 'alipay' THEN COALESCE(?, alipay_trade_no) ELSE alipay_trade_no END, external_trade_no = COALESCE(?, external_trade_no), entitlement_id = ? WHERE id = ? AND status = 'pending'")
+    .bind(timestamp, tradeNo, tradeNo, entitlementId, order.id));
 
   const user = await env.DB.prepare("SELECT inviter_admin_id FROM users WHERE id = ?").bind(order.user_id).first<{ inviter_admin_id: string | null }>();
   if (user?.inviter_admin_id && order.cash_cents > 0) {
@@ -274,21 +275,22 @@ app.post("/api/app/orders", async (c) => {
   const cashCents = plan.price_cents - walletCents;
   const orderId = newId("ord");
   const expiresAt = timestamp + 15 * 60;
+  const paymentMethod = cashCents > 0 ? await resolveAlipayConfig(c.env) : null;
   await c.env.DB.batch([
     c.env.DB.prepare("UPDATE orders SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'").bind(user.id),
     c.env.DB.prepare(
-      `INSERT INTO orders (id, user_id, plan_id, status, price_cents, wallet_cents, cash_cents, upgrade_credit_cents, upgrade_from_entitlement_id, expires_at, created_at, duration_days, quota_bytes, node_pool_bps)
-       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(orderId, user.id, plan.id, plan.price_cents, walletCents, cashCents, upgradeCredit, upgrade?.id || null, expiresAt, timestamp, plan.duration_days, plan.quota_bytes, plan.node_pool_bps),
+      `INSERT INTO orders (id, user_id, plan_id, status, price_cents, wallet_cents, cash_cents, upgrade_credit_cents, upgrade_from_entitlement_id, expires_at, created_at, duration_days, quota_bytes, node_pool_bps, payment_method_id, payment_provider)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(orderId, user.id, plan.id, plan.price_cents, walletCents, cashCents, upgradeCredit, upgrade?.id || null, expiresAt, timestamp, plan.duration_days, plan.quota_bytes, plan.node_pool_bps, paymentMethod?.id || null, paymentMethod ? "alipay" : null),
   ]);
   if (cashCents === 0) {
     await activateOrder(c.env, orderId, null);
     return c.json({ orderId, status: "paid", cashCents: 0, walletCents, upgradeCredit }, 201);
   }
   try {
-    const qr = await createAlipayQr(c.env, orderId, `BoardLess - ${plan.name}`, cashCents, expiresAt);
+    const qr = await createAlipayQr(paymentMethod!, c.env.APP_ORIGIN, orderId, `BoardLess - ${plan.name}`, cashCents, expiresAt);
     await c.env.DB.prepare("UPDATE orders SET qr_code = ? WHERE id = ?").bind(qr.qrContent, orderId).run();
-    return c.json({ orderId, status: "pending", cashCents, walletCents, upgradeCredit, expiresAt, qrImage: qr.qrImage }, 201);
+    return c.json({ orderId, status: "pending", cashCents, walletCents, upgradeCredit, expiresAt, qrImage: qr.qrImage, paymentProvider: "alipay", paymentName: paymentMethod!.name }, 201);
   } catch (error) {
     await c.env.DB.prepare("UPDATE orders SET status = 'cancelled' WHERE id = ?").bind(orderId).run();
     throw error;
@@ -313,26 +315,34 @@ app.post("/api/app/orders/:id/query", async (c) => {
   const order = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").bind(c.req.param("id"), user.id).first<OrderRecord>();
   if (!order) return c.json({ error: "订单不存在" }, 404);
   if (order.status !== "pending") return c.json({ status: order.status });
-  const result = await queryAlipayOrder(c.env, order.id);
+  if (order.payment_provider && order.payment_provider !== "alipay") return c.json({ error: "该支付方式暂不支持主动查询" }, 400);
+  const paymentMethod = await resolveAlipayConfig(c.env, order.payment_method_id);
+  const result = await queryAlipayOrder(paymentMethod, c.env.APP_ORIGIN, order.id);
   if (["TRADE_SUCCESS", "TRADE_FINISHED"].includes(String(result.trade_status))) await activateOrder(c.env, order.id, String(result.trade_no || ""));
   return c.json({ status: ["TRADE_SUCCESS", "TRADE_FINISHED"].includes(String(result.trade_status)) ? "paid" : "pending" });
 });
 
-app.post("/api/payments/alipay/notify", async (c) => {
+async function handleAlipayNotification(c: Context<App>, paymentMethodId?: string) {
   const form = await c.req.parseBody();
   const params = Object.fromEntries(Object.entries(form).map(([name, value]) => [name, String(value)]));
-  if (!verifyAlipayNotification(params, c.env.ALIPAY_PUBLIC_KEY) || params.app_id !== c.env.ALIPAY_APP_ID) return c.text("failure", 400);
+  let paymentMethod;
+  try { paymentMethod = await resolveAlipayConfig(c.env, paymentMethodId || null); }
+  catch { return c.text("failure", 400); }
+  if (!verifyAlipayNotification(params, paymentMethod.config.publicKey) || params.app_id !== paymentMethod.config.appId) return c.text("failure", 400);
   if (!["TRADE_SUCCESS", "TRADE_FINISHED"].includes(params.trade_status)) return c.text("success");
   const order = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(params.out_trade_no).first<OrderRecord>();
-  if (!order || Math.round(Number(params.total_amount) * 100) !== order.cash_cents) return c.text("failure", 400);
-  const eventKey = params.notify_id || `${params.trade_no}:${params.trade_status}`;
+  if (!order || (paymentMethod.id && order.payment_method_id !== paymentMethod.id) || Math.round(Number(params.total_amount) * 100) !== order.cash_cents) return c.text("failure", 400);
+  const eventKey = `alipay:${paymentMethod.id || "env"}:${params.notify_id || `${params.trade_no}:${params.trade_status}`}`;
   const seen = await c.env.DB.prepare("SELECT 1 FROM payment_events WHERE event_key = ?").bind(eventKey).first();
   if (seen) return c.text("success");
   await activateOrder(c.env, order.id, params.trade_no);
   await c.env.DB.prepare("INSERT INTO payment_events (event_key, order_id, payload_hash, created_at) VALUES (?, ?, ?, ?)")
     .bind(eventKey, order.id, await sha256(JSON.stringify(params)), now()).run();
   return c.text("success");
-});
+}
+
+app.post("/api/payments/alipay/notify", (c) => handleAlipayNotification(c));
+app.post("/api/payments/alipay/notify/:methodId", (c) => handleAlipayNotification(c, c.req.param("methodId")));
 
 async function ensureActiveAdmin(env: Env, userId: string) {
   const profile = await env.DB.prepare("SELECT disabled_at FROM admin_profiles WHERE user_id = ?").bind(userId).first<{ disabled_at: number | null }>();
@@ -889,6 +899,70 @@ app.post("/api/owner/invitations", async (c) => {
   const invite = await createInvitation(c.env, c.get("user").id, "admin", Number(input.expiresHours || 72));
   await audit(c.env, c.get("user").id, "invitation.create", "invitation", invite.id, { role: "admin" });
   return c.json({ ...invite, url: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/invite/${invite.token}` }, 201);
+});
+
+app.get("/api/owner/payment-methods", async (c) => {
+  const row = await c.env.DB.prepare(
+    "SELECT id, provider, display_name, enabled, config_json, secret_ciphertext, updated_at FROM payment_methods WHERE provider = 'alipay' LIMIT 1",
+  ).first<{ id: string; provider: string; display_name: string; enabled: number; config_json: string; secret_ciphertext: string; updated_at: number }>();
+  if (row) {
+    const config = JSON.parse(row.config_json || "{}") as Record<string, string>;
+    let appId = "";
+    try { appId = (await openPaymentSecrets(row.secret_ciphertext, c.env.SESSION_SECRET)).appId || ""; } catch { /* The UI still lets the owner replace broken credentials. */ }
+    return c.json({
+      methods: [{ id: row.id, provider: row.provider, displayName: row.display_name, enabled: Boolean(row.enabled), gateway: config.gateway || "", appId, hasCredentials: Boolean(row.secret_ciphertext), source: "database", updatedAt: row.updated_at }],
+      supportedProviders: [{ id: "alipay", name: "支付宝当面付", available: true }],
+    });
+  }
+  const configured = Boolean(c.env.ALIPAY_APP_ID && c.env.ALIPAY_PRIVATE_KEY && c.env.ALIPAY_PUBLIC_KEY);
+  return c.json({
+    methods: configured ? [{ id: null, provider: "alipay", displayName: "支付宝", enabled: true, gateway: c.env.ALIPAY_GATEWAY, appId: c.env.ALIPAY_APP_ID, hasCredentials: true, source: "environment", updatedAt: null }] : [],
+    supportedProviders: [{ id: "alipay", name: "支付宝当面付", available: true }],
+  });
+});
+
+app.put("/api/owner/payment-methods/alipay", async (c) => {
+  assertMutation(c);
+  const input = await body<{ displayName?: string; enabled?: boolean; gateway?: string; appId?: string; privateKey?: string; publicKey?: string }>(c);
+  const displayName = String(input.displayName || "支付宝").trim();
+  if (!displayName || displayName.length > 40) return c.json({ error: "支付方式名称不能为空且最多 40 字" }, 400);
+  let gateway: URL;
+  try { gateway = new URL(String(input.gateway || "https://openapi.alipay.com/gateway.do")); }
+  catch { return c.json({ error: "支付宝网关地址无效" }, 400); }
+  if (gateway.protocol !== "https:") return c.json({ error: "支付宝网关必须使用 HTTPS" }, 400);
+
+  const current = await c.env.DB.prepare("SELECT secret_ciphertext FROM payment_methods WHERE provider = 'alipay' LIMIT 1")
+    .first<{ secret_ciphertext: string }>();
+  let secrets: Record<string, string> = { appId: c.env.ALIPAY_APP_ID || "", privateKey: c.env.ALIPAY_PRIVATE_KEY || "", publicKey: c.env.ALIPAY_PUBLIC_KEY || "" };
+  if (current?.secret_ciphertext) {
+    try { secrets = await openPaymentSecrets(current.secret_ciphertext, c.env.SESSION_SECRET); }
+    catch {
+      if (!input.appId?.trim() || !input.privateKey?.trim() || !input.publicKey?.trim()) throw new Error("原支付配置无法解密，请重新填写全部支付凭据");
+    }
+  }
+  secrets = {
+    appId: String(input.appId || "").trim() || secrets.appId,
+    privateKey: String(input.privateKey || "").trim() || secrets.privateKey,
+    publicKey: String(input.publicKey || "").trim() || secrets.publicKey,
+  };
+  if (input.enabled !== false && (!secrets.appId || !secrets.privateKey || !secrets.publicKey)) return c.json({ error: "启用支付宝前必须填写应用 ID、应用私钥和支付宝公钥" }, 400);
+  if (secrets.privateKey && !secrets.privateKey.includes("PRIVATE KEY")) return c.json({ error: "支付宝应用私钥必须是 PEM 格式" }, 400);
+  if (secrets.publicKey && !secrets.publicKey.includes("PUBLIC KEY")) return c.json({ error: "支付宝公钥必须是 PEM 格式" }, 400);
+
+  const pending = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM orders WHERE status = 'pending' AND cash_cents > 0 AND expires_at > ?")
+    .bind(now()).first<{ count: number }>();
+  if (Number(pending?.count || 0) > 0) return c.json({ error: "仍有未完成的支付订单，请等待订单完成或过期后再修改支付配置" }, 409);
+
+  const actorId = c.get("user").id;
+  const timestamp = now();
+  await c.env.DB.prepare(
+    `INSERT INTO payment_methods (id, provider, display_name, enabled, config_json, secret_ciphertext, created_by, updated_by, created_at, updated_at)
+     VALUES ('pay_alipay', 'alipay', ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(provider) DO UPDATE SET display_name = excluded.display_name, enabled = excluded.enabled, config_json = excluded.config_json,
+       secret_ciphertext = excluded.secret_ciphertext, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+  ).bind(displayName, input.enabled === false ? 0 : 1, JSON.stringify({ gateway: gateway.toString() }), await sealPaymentSecrets(secrets, c.env.SESSION_SECRET), actorId, actorId, timestamp, timestamp).run();
+  await audit(c.env, actorId, "payment_method.update", "payment_method", "pay_alipay", { provider: "alipay", enabled: input.enabled !== false, gateway: gateway.toString() });
+  return c.json({ ok: true });
 });
 
 app.get("/api/owner/orders", async (c) => {

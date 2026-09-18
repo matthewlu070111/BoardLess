@@ -112,7 +112,8 @@ const ownerNav: NavItem[] = [
   { to: "/owner", label: "全站概览", icon: "⌂" }, { to: "/owner/nodes", label: "节点管理", icon: "⌘" },
   { to: "/owner/backends", label: "后端仓库", icon: "↯" },
   { to: "/owner/plans", label: "套餐编排", icon: "◇" }, { to: "/owner/users", label: "账号管理", icon: "♙" },
-  { to: "/owner/orders", label: "订单", icon: "▤" }, { to: "/owner/withdrawals", label: "提现审核", icon: "¥" }, { to: "/owner/audit", label: "审计日志", icon: "◉" },
+  { to: "/owner/payments", label: "支付对接", icon: "¤" }, { to: "/owner/orders", label: "订单", icon: "▤" },
+  { to: "/owner/withdrawals", label: "提现审核", icon: "¥" }, { to: "/owner/audit", label: "审计日志", icon: "◉" },
 ];
 
 function Protected({ role, children }: { role?: "admin" | "owner"; children: ReactNode }) {
@@ -201,7 +202,7 @@ function Plans() {
     {!plans.length && <Empty>暂无可购买套餐</Empty>}
     {payment && <div className="modal-layer"><section className="modal payment-modal"><button className="modal-close" onClick={() => setPayment(null)}>×</button>
       {payment.status === "paid" ? <div className="payment-success"><div>✓</div><h2>套餐已生效</h2><p>已使用钱包 {money(payment.walletCents)}，支付宝支付 {money(payment.cashCents)}。</p><Link className="button primary" to="/app/subscription" onClick={() => setPayment(null)}>查看订阅</Link></div> : payment.status !== "pending" ? <div className="payment-success"><div>!</div><h2>订单{payment.status === "expired" ? "已过期" : "未完成"}</h2><button className="button" onClick={() => setPayment(null)}>关闭</button></div> : <>
-        <p className="eyebrow">支付宝当面付</p><h2>扫码完成支付</h2><div className="payment-amount">{money(payment.cashCents)}</div>{payment.qrImage && <img src={payment.qrImage} alt="支付宝支付二维码" className="qr" />}<p className="muted">钱包抵扣 {money(payment.walletCents)}{payment.upgradeCredit ? `，含升级折算 ${money(payment.upgradeCredit)}` : ""}</p><button className="button" onClick={() => api(`/api/app/orders/${payment.orderId}/query`, { method: "POST", body: "{}" }).then((r: any) => setPayment({ ...payment, status: r.status }))}>我已支付，查询状态</button>
+        <p className="eyebrow">{payment.paymentName || "支付宝"}</p><h2>扫码完成支付</h2><div className="payment-amount">{money(payment.cashCents)}</div>{payment.qrImage && <img src={payment.qrImage} alt={`${payment.paymentName || "支付宝"}支付二维码`} className="qr" />}<p className="muted">钱包抵扣 {money(payment.walletCents)}{payment.upgradeCredit ? `，含升级折算 ${money(payment.upgradeCredit)}` : ""}</p><button className="button" onClick={() => api(`/api/app/orders/${payment.orderId}/query`, { method: "POST", body: "{}" }).then((r: any) => setPayment({ ...payment, status: r.status }))}>我已支付，查询状态</button>
       </>}
     </section></div>}
   </Page>;
@@ -389,6 +390,48 @@ function OwnerUsers() {
   </Page>;
 }
 
+function OwnerPayments() {
+  const [data, setData] = useState<Json | null>(null);
+  const [form, setForm] = useState<Json>({ displayName: "支付宝", enabled: false, gateway: "https://openapi.alipay.com/gateway.do", appId: "", privateKey: "", publicKey: "" });
+  const [error, setError] = useState(""); const [notice, setNotice] = useState(""); const [busy, setBusy] = useState(false);
+  const load = async () => {
+    const result = await api<Json>("/api/owner/payment-methods");
+    setData(result);
+    const method = result.methods.find((item: Json) => item.provider === "alipay");
+    if (method) setForm((current: Json) => ({ ...current, displayName: method.displayName, enabled: method.enabled, gateway: method.gateway, appId: method.appId }));
+  };
+  useEffect(() => { void load().catch((reason) => setError(reason.message)); }, []);
+  const save = async (event: FormEvent) => {
+    event.preventDefault(); setBusy(true); setError(""); setNotice("");
+    try {
+      await api("/api/owner/payment-methods/alipay", { method: "PUT", body: JSON.stringify(form) });
+      setNotice("支付宝支付配置已保存；新订单会使用这组配置。");
+      setForm((current: Json) => ({ ...current, privateKey: "", publicKey: "" }));
+      await load();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); }
+    finally { setBusy(false); }
+  };
+  if (!data && !error) return <Loading />;
+  const method = data?.methods.find((item: Json) => item.provider === "alipay");
+  return <Page title="支付对接" description="由站长统一维护支付渠道；私钥加密保存且不会回显">
+    {notice && <Notice tone="success">{notice}</Notice>}{error && <Notice tone="danger">{error}</Notice>}
+    <div className="two-column">
+      <form className="panel form-stack" onSubmit={save}>
+        <div className="row-between"><h2>支付宝当面付</h2><Badge value={form.enabled ? "enabled" : "disabled"} /></div>
+        {method?.source === "environment" && <Notice>当前读取部署环境变量；保存后将改用站长后台配置。</Notice>}
+        <Field label="显示名称"><input required maxLength={40} value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></Field>
+        <Field label="支付宝网关"><input type="url" required value={form.gateway} onChange={(event) => setForm({ ...form, gateway: event.target.value })} /></Field>
+        <Field label="应用 ID"><input value={form.appId} onChange={(event) => setForm({ ...form, appId: event.target.value })} placeholder="支付宝开放平台 App ID" /></Field>
+        <Field label="应用私钥" hint={method?.hasCredentials ? "留空则保留已经保存的私钥" : "PKCS#8 PEM 格式"}><textarea rows={6} value={form.privateKey} onChange={(event) => setForm({ ...form, privateKey: event.target.value })} placeholder="-----BEGIN PRIVATE KEY-----" /></Field>
+        <Field label="支付宝公钥" hint={method?.hasCredentials ? "留空则保留已经保存的公钥" : "PEM 格式"}><textarea rows={6} value={form.publicKey} onChange={(event) => setForm({ ...form, publicKey: event.target.value })} placeholder="-----BEGIN PUBLIC KEY-----" /></Field>
+        <label className="check"><input type="checkbox" checked={Boolean(form.enabled)} onChange={(event) => setForm({ ...form, enabled: event.target.checked })} /> 启用此支付方式</label>
+        <button className="button primary" disabled={busy}>{busy ? "保存中…" : "保存支付配置"}</button>
+      </form>
+      <section className="panel table-wrap"><h2>可对接渠道</h2><table><thead><tr><th>渠道</th><th>能力</th><th>状态</th></tr></thead><tbody>{data?.supportedProviders.map((provider: Json) => <tr key={provider.id}><td><strong>{provider.name}</strong><small className="cell-sub">{provider.id}</small></td><td>扫码下单、异步通知、主动查单</td><td><Badge value={method?.enabled ? "enabled" : "disabled"} /></td></tr>)}</tbody></table><p className="muted payment-help">支付渠道采用适配器结构；新增微信支付、Stripe 等渠道时需实现各自的签名、下单、回调和查单逻辑，再在此页面开放配置。</p></section>
+    </div>
+  </Page>;
+}
+
 function OwnerOrders() {
   const [rows, setRows] = useState<Json[] | null>(null); useEffect(() => { api<Json>("/api/owner/orders").then((r) => setRows(r.orders)); }, []); if (!rows) return <Loading />;
   return <Page title="全站订单" description="首版不提供线上退款"><section className="panel table-wrap"><table><thead><tr><th>用户</th><th>套餐</th><th>订单</th><th>实收</th><th>钱包</th><th>状态</th><th>时间</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{row.email}</td><td>{row.plan_name}</td><td className="mono">{row.id.slice(-10)}</td><td>{money(row.cash_cents)}</td><td>{money(row.wallet_cents)}</td><td><Badge value={row.status} /></td><td>{date(row.created_at)}</td></tr>)}</tbody></table>{!rows.length && <Empty>暂无订单</Empty>}</section></Page>;
@@ -459,7 +502,7 @@ function App() {
     <Route path="/login" element={<Login />} /><Route path="/admin/login" element={<Login admin />} /><Route path="/invite/:token" element={<Invite />} />
     <Route path="/app" element={<UserArea><UserDashboard /></UserArea>} /><Route path="/app/plans" element={<UserArea><Plans /></UserArea>} /><Route path="/app/subscription" element={<UserArea><Subscription /></UserArea>} /><Route path="/app/usage" element={<UserArea><Usage /></UserArea>} /><Route path="/app/orders" element={<UserArea><Orders /></UserArea>} />
     <Route path="/admin" element={<AdminArea><AdminDashboard /></AdminArea>} /><Route path="/admin/nodes" element={<AdminArea><AdminNodes /></AdminArea>} /><Route path="/admin/deploy" element={<AdminArea><AdminDeploy /></AdminArea>} /><Route path="/admin/users" element={<AdminArea><AdminUsers /></AdminArea>} /><Route path="/admin/earnings" element={<AdminArea><AdminEarnings /></AdminArea>} />
-    <Route path="/owner" element={<OwnerArea><OwnerDashboard /></OwnerArea>} /><Route path="/owner/nodes" element={<OwnerArea><OwnerNodes /></OwnerArea>} /><Route path="/owner/backends" element={<OwnerArea><OwnerBackends /></OwnerArea>} /><Route path="/owner/plans" element={<OwnerArea><OwnerPlans /></OwnerArea>} /><Route path="/owner/users" element={<OwnerArea><OwnerUsers /></OwnerArea>} /><Route path="/owner/orders" element={<OwnerArea><OwnerOrders /></OwnerArea>} /><Route path="/owner/withdrawals" element={<OwnerArea><OwnerWithdrawals /></OwnerArea>} /><Route path="/owner/audit" element={<OwnerArea><OwnerAudit /></OwnerArea>} />
+    <Route path="/owner" element={<OwnerArea><OwnerDashboard /></OwnerArea>} /><Route path="/owner/nodes" element={<OwnerArea><OwnerNodes /></OwnerArea>} /><Route path="/owner/backends" element={<OwnerArea><OwnerBackends /></OwnerArea>} /><Route path="/owner/plans" element={<OwnerArea><OwnerPlans /></OwnerArea>} /><Route path="/owner/users" element={<OwnerArea><OwnerUsers /></OwnerArea>} /><Route path="/owner/payments" element={<OwnerArea><OwnerPayments /></OwnerArea>} /><Route path="/owner/orders" element={<OwnerArea><OwnerOrders /></OwnerArea>} /><Route path="/owner/withdrawals" element={<OwnerArea><OwnerWithdrawals /></OwnerArea>} /><Route path="/owner/audit" element={<OwnerArea><OwnerAudit /></OwnerArea>} />
     <Route path="*" element={<NotFound />} />
   </Routes>;
 }

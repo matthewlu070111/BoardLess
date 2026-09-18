@@ -1,0 +1,86 @@
+name: Sync BoardLess upstream
+
+on:
+  workflow_dispatch:
+  # Automatic checks are opt-in. Repository owners can uncomment these lines.
+  # schedule:
+  #   - cron: "17 3 * * *" # Daily at 03:17 UTC.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-boardless-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: matthewlu070111/BoardLess
+  UPSTREAM_BRANCH: main
+  UPDATE_BRANCH: boardless-upstream-update
+
+jobs:
+  sync:
+    # The canonical repository publishes updates; deployed copies consume them.
+    if: github.repository != 'matthewlu070111/BoardLess'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the deployed repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Merge the latest upstream changes
+        id: merge
+        env:
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove boardless-upstream 2>/dev/null || true
+          git remote add boardless-upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags boardless-upstream "${UPSTREAM_BRANCH}"
+          git checkout -B "${UPDATE_BRANCH}" "origin/${TARGET_BRANCH}"
+
+          if ! git merge --no-edit "boardless-upstream/${UPSTREAM_BRANCH}"; then
+            git merge --abort || true
+            echo "Upstream changes conflict with this repository. Resolve the update manually." >&2
+            exit 1
+          fi
+
+          if [[ "$(git rev-list --count "origin/${TARGET_BRANCH}..HEAD")" -eq 0 ]]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push --force origin "HEAD:refs/heads/${UPDATE_BRANCH}"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the upstream update pull request
+        if: steps.merge.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          existing_pr="$(gh pr list \
+            --base "${TARGET_BRANCH}" \
+            --head "${UPDATE_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [[ -n "${existing_pr}" ]]; then
+            echo "Updated existing pull request #${existing_pr}."
+            exit 0
+          fi
+
+          gh pr create \
+            --base "${TARGET_BRANCH}" \
+            --head "${UPDATE_BRANCH}" \
+            --title "Update BoardLess from upstream" \
+            --body $'This pull request was created automatically from `matthewlu070111/BoardLess` upstream changes.\n\nReview the diff and checks before merging. Merging into the production branch will trigger Cloudflare Workers Builds.'

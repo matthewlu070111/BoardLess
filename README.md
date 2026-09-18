@@ -19,7 +19,7 @@ BoardLess 是一个轻量的订阅与节点管理面板，提供用户中心、�
 
 | 后端 | 简介 | 支持的预设 |
 | --- | --- | --- |
-| [matthewlu070111/BoardRay](https://github.com/matthewlu070111/BoardRay) | 由 Xray 驱动的节点 Agent，可接入 BoardLess，并安全地拉取用户、应用配置和上报流量。 | VLESS + TCP + TLS + XTLS Vision；VLESS + TCP/RAW + REALITY + XTLS Vision |
+| [BoardRay](https://github.com/matthewlu070111/BoardRay) | 由 Xray 驱动的节点 Agent，可接入 BoardLess，并安全地拉取用户、应用配置和上报流量。 | VLESS + TCP + TLS + XTLS Vision；VLESS + TCP/RAW + REALITY + XTLS Vision |
 
 ## 技术栈
 
@@ -78,11 +78,60 @@ curl -X POST 'https://boardless.xxxxx.workers.dev/api/setup/bootstrap' \
 
 ## 更新与回滚
 
-Linux 自托管安装建议使用稳定版本标签（例如 `v0.2.0`）或提交 SHA。Cloudflare 部署由 Workers Builds 持续监听 BoardLess 原始仓库的生产分支，并在该分支收到新 commit 后自动构建和部署。
+Linux 自托管安装建议使用稳定版本标签（例如 `v0.2.0`）或提交 SHA。Cloudflare Workers Builds 会监听部署时连接的 Git 仓库，并在其生产分支收到 push 后自动构建和部署。
 
 ### Cloudflare 更新
 
-Deploy to Cloudflare 完成首次部署后，Workers Builds 会持续跟踪 BoardLess 原始仓库的生产分支（默认是 `main`）。原始仓库出现新 commit 时，Cloudflare 会自动读取该 commit、执行部署命令并发布新版本；站长无需手工同步仓库、拉取代码或再次运行一键部署脚本。
+Deploy to Cloudflare 按钮会在部署者的 GitHub 或 GitLab 账号中创建一份仓库副本，将该副本连接到 Worker，并配置 Workers Builds。此后，连接仓库的生产分支（默认是 `main`）每次收到 push，Cloudflare 都会自动读取对应 commit、执行部署命令并发布新版本。
+
+Cloudflare 不会自动从 `matthewlu070111/BoardLess` 原始仓库向部署者的仓库副本拉取更新。Worker 运行时没有 Git 工作区；Workers Builds 也只会在一次构建中临时检出已连接仓库的内容，不会替仓库副本执行持久化的 `git fetch`、合并或 push。
+
+下面的手动同步方式要求站长先把自己的仓库副本克隆到本地，再在该本地工作区同步上游并推送：
+
+```bash
+# 首次同步时添加上游；后续不必重复执行
+git remote add upstream https://github.com/matthewlu070111/BoardLess.git
+
+git fetch upstream
+git checkout main
+git merge upstream/main
+git push origin main
+```
+
+最后的 `git push` 会自动触发 Workers Builds。如果仓库副本中有自定义修改，应在推送前解决合并冲突并完成测试。
+
+如果不希望站长维护本地 Git 工作区，可以使用项目自带的 [GitHub Actions 上游同步模板](.github/workflows/sync-boardless-upstream.yml)。模板默认只允许仓库所有者在 GitHub 网页手动检查更新，不会自动定时运行；发现更新后会创建或更新 `boardless-upstream-update` 分支及 Pull Request，不会直接覆盖生产分支。
+
+#### 启用 GitHub Actions 自动检查更新
+
+Deploy to Cloudflare 创建仓库副本后，在该仓库中完成以下设置：
+
+1. 打开仓库的 **Settings → Actions → General**。
+2. 在 **Workflow permissions** 中选择 **Read and write permissions**。
+3. 勾选 **Allow GitHub Actions to create and approve pull requests**，然后保存。如果该选项被组织策略锁定，需要由组织管理员开放权限。
+4. 打开仓库的 **Actions** 页面；如果 GitHub 提示工作流尚未启用，先点击启用。
+5. 选择 **Sync BoardLess upstream**，点击 **Run workflow** 手动检查一次，确认工作流可以正常创建 Pull Request。
+6. 需要自动检查时，编辑 `.github/workflows/sync-boardless-upstream.yml`，取消 `schedule` 三行前面的注释并提交：
+
+   ```yaml
+   on:
+     workflow_dispatch:
+     schedule:
+       - cron: "17 3 * * *" # UTC 每天 03:17
+   ```
+
+   提交后 GitHub 才会开始定时运行；不取消注释就会一直保持纯手动模式。
+
+工作流不需要额外创建 Personal Access Token，使用仓库自动提供的 `GITHUB_TOKEN`，权限仅限写入更新分支和创建 Pull Request。发现更新后：
+
+1. 打开机器人创建的 **Update BoardLess from upstream** Pull Request。
+2. 检查文件差异和测试结果，特别留意 `wrangler.jsonc` 以及自己的定制代码。
+3. 确认无误后合并 Pull Request。
+4. 合并产生的 `main` 分支 push 会触发 Cloudflare Workers Builds，自动执行 `npm run deploy`。
+
+如果上游修改与仓库副本存在 Git 冲突，工作流会安全停止并在 Actions 日志中报错，不会强制覆盖文件。此时仍需在本地解决冲突。要修改检查频率，可调整 `schedule` 中的 cron 表达式；要关闭自动检查，重新注释或删除 `schedule`，保留 `workflow_dispatch` 即可。
+
+模板还包含源仓库保护条件：当仓库本身是 `matthewlu070111/BoardLess` 时，同步任务会直接跳过，避免源仓库反向同步自身。自动检查仍然默认关闭，是否启用完全由部署者决定。
 
 本项目在 `package.json` 中定义的 Cloudflare 部署命令为：
 
@@ -96,7 +145,9 @@ npm run deploy
 
 回滚代码时，可以在仓库中 revert 对应 commit 并推送到生产分支，让 Workers Builds 自动重新部署。已应用的 D1 migration 不会随代码 commit 自动回滚，需要回退数据库时应使用 D1 备份或 Time Travel 单独处理。
 
-仓库中的 `scripts/deploy-cloudflare.sh` 主要用于本地 CLI 手动部署。只有采用这种方式时，才依赖本地 `.cloudflare.secrets.json` 来保持重复部署时的密钥不变；通过部署按钮和 Workers Builds 自动更新不需要运行该脚本。
+Cloudflare 还提供两种手动触发构建的方式：Deploy Hook 可以重新构建某个已连接分支，Workers Builds API 可以指定已连接仓库中的分支或 commit SHA。它们只负责触发构建，不会把 BoardLess 原始仓库的更新拉入仓库副本，因此不能代替上述 Git 同步步骤。
+
+仓库中的 `scripts/deploy-cloudflare.sh` 主要用于本地 CLI 手动部署。只有采用这种方式时，才依赖本地 `.cloudflare.secrets.json` 来保持重复部署时的密钥不变；通过部署按钮和 Workers Builds 更新不需要运行该脚本。
 
 ### Linux 一键安装更新
 

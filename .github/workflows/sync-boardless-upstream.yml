@@ -45,8 +45,53 @@ jobs:
           git fetch --no-tags boardless-upstream "${UPSTREAM_BRANCH}"
           git checkout -B "${UPDATE_BRANCH}" "origin/${TARGET_BRANCH}"
 
+          abort_merge() {
+            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              git merge --abort
+            fi
+          }
+
+          snapshot_fingerprint() {
+            # Cloudflare omits .github from the copied repository. Compare the
+            # remaining tracked files, including their modes and blob IDs.
+            git ls-tree -r --full-tree "$1" \
+              | awk -F '\t' '$2 !~ /^\.github(\/|$)/' \
+              | git hash-object --stdin
+          }
+
+          # Deploy to Cloudflare creates a repository copy with a new root
+          # commit rather than a GitHub fork, and excludes .github. Find the
+          # upstream commit whose remaining files were copied, then record it
+          # as the merge base without changing the deployed files. A direct
+          # unrelated-history merge would treat normal edits as add/add conflicts.
+          if ! git merge-base "origin/${TARGET_BRANCH}" "boardless-upstream/${UPSTREAM_BRANCH}" >/dev/null; then
+            upstream_base=""
+            while read -r target_root; do
+              target_fingerprint="$(snapshot_fingerprint "${target_root}")"
+              while read -r upstream_candidate; do
+                if [[ "$(snapshot_fingerprint "${upstream_candidate}")" == "${target_fingerprint}" ]]; then
+                  upstream_base="${upstream_candidate}"
+                  break
+                fi
+              done < <(git rev-list "boardless-upstream/${UPSTREAM_BRANCH}")
+              [[ -z "${upstream_base}" ]] || break
+            done < <(git rev-list --max-parents=0 "origin/${TARGET_BRANCH}")
+
+            if [[ -z "${upstream_base}" ]]; then
+              echo "Cannot identify which upstream commit this repository was copied from." >&2
+              echo "The initial repository snapshot may have been modified; resolve the first update manually." >&2
+              exit 1
+            fi
+
+            git merge \
+              --strategy=ours \
+              --no-edit \
+              --allow-unrelated-histories \
+              "${upstream_base}"
+          fi
+
           if ! git merge --no-edit "boardless-upstream/${UPSTREAM_BRANCH}"; then
-            git merge --abort || true
+            abort_merge
             echo "Upstream changes conflict with this repository. Resolve the update manually." >&2
             exit 1
           fi

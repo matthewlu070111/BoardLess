@@ -94,9 +94,32 @@ git remote add upstream https://github.com/matthewlu070111/BoardLess.git
 
 git fetch upstream
 git checkout main
+
+# 仅首次同步需要：找到 Cloudflare 复制时对应的上游快照并连接历史
+if ! git merge-base HEAD upstream/main >/dev/null; then
+  snapshot_fingerprint() {
+    git ls-tree -r --full-tree "$1" \
+      | awk -F '\t' '$2 !~ /^\.github(\/|$)/' \
+      | git hash-object --stdin
+  }
+  ROOT_COMMIT="$(git rev-list --max-parents=0 HEAD | head -n 1)"
+  ROOT_FINGERPRINT="$(snapshot_fingerprint "${ROOT_COMMIT}")"
+  UPSTREAM_BASE=""
+  while read -r CANDIDATE; do
+    if test "$(snapshot_fingerprint "${CANDIDATE}")" = "${ROOT_FINGERPRINT}"; then
+      UPSTREAM_BASE="${CANDIDATE}"
+      break
+    fi
+  done < <(git rev-list upstream/main)
+  test -n "${UPSTREAM_BASE}" || { echo "无法识别初始上游版本，请手动处理首次同步" >&2; exit 1; }
+  git merge -s ours --allow-unrelated-histories -m "Connect BoardLess upstream history" "${UPSTREAM_BASE}"
+fi
+
 git merge upstream/main
 git push origin main
 ```
+
+首次同步不能直接对最新上游使用 `--allow-unrelated-histories`：那会让 Git 把普通更新误判为同名文件的 `add/add` 冲突。上面的命令排除 Cloudflare 未复制的 `.github/` 后比较初始文件快照，找到真正的上游基线，用一个不改变文件的合并提交连接两条历史，再正常应用基线之后的更新。成功连接后，后续同步只会执行普通三方合并。如副本中存在自定义修改，仍需人工确认真实的内容冲突。
 
 最后的 `git push` 会自动触发 Workers Builds。如果仓库副本中有自定义修改，应在推送前解决合并冲突并完成测试。
 
@@ -106,12 +129,13 @@ git push origin main
 
 Deploy to Cloudflare 创建仓库副本后，在该仓库中完成以下设置：
 
-1. 打开仓库的 **Settings → Actions → General**。
-2. 在 **Workflow permissions** 中选择 **Read and write permissions**。
-3. 勾选 **Allow GitHub Actions to create and approve pull requests**，然后保存。如果该选项被组织策略锁定，需要由组织管理员开放权限。
-4. 打开仓库的 **Actions** 页面；如果 GitHub 提示工作流尚未启用，先点击启用。
-5. 选择 **Sync BoardLess upstream**，点击 **Run workflow** 手动检查一次，确认工作流可以正常创建 Pull Request。
-6. 需要自动检查时，编辑 `.github/workflows/sync-boardless-upstream.yml`，取消 `schedule` 三行前面的注释并提交：
+1. Cloudflare 创建副本时会筛除整个 `.github/` 目录。先从原始 BoardLess 仓库手动复制 `.github/workflows/sync-boardless-upstream.yml` 到副本中的相同路径，并提交到默认分支。
+2. 打开仓库的 **Settings → Actions → General**。
+3. 在 **Workflow permissions** 中选择 **Read and write permissions**。
+4. 勾选 **Allow GitHub Actions to create and approve pull requests**，然后保存。如果该选项被组织策略锁定，需要由组织管理员开放权限。
+5. 打开仓库的 **Actions** 页面；如果 GitHub 提示工作流尚未启用，先点击启用。
+6. 选择 **Sync BoardLess upstream**，点击 **Run workflow** 手动检查一次，确认工作流可以正常创建 Pull Request。
+7. 需要自动检查时，编辑 `.github/workflows/sync-boardless-upstream.yml`，取消 `schedule` 三行前面的注释并提交：
 
    ```yaml
    on:

@@ -31,7 +31,23 @@ describe("protocol validation and rendering", () => {
     const singbox = renderSubscription("singbox", nodes(), credential);
     expect(clash.body).toContain("hysteria2");
     expect(clash.body).toContain("tuic");
-    expect(JSON.parse(singbox.body).outbounds).toHaveLength(6);
+    expect(clash.body).toContain("proxy-groups:");
+    expect(clash.body).toContain("GEOIP,CN,DIRECT");
+    const singboxConfig = JSON.parse(singbox.body);
+    expect(singboxConfig.outbounds.filter((outbound: { server?: string }) => outbound.server)).toHaveLength(6);
+    expect(singboxConfig.route.final).toBe("Proxy");
+    expect(singboxConfig.route.rule_set).toHaveLength(2);
+  });
+
+  it("renders a plain Shadowrocket node subscription and exposes node multipliers", () => {
+    const input = nodes();
+    input[0].multiplier_bps = 25000;
+    const result = renderSubscription("shadowrocket", input, credential);
+    const decoded = Buffer.from(result.body, "base64").toString("utf8");
+    expect(decoded).not.toContain("[Rule]");
+    expect(decoded).toContain(encodeURIComponent("Test shadowsocks [2.5x]"));
+    expect(decoded.split("\n")).toHaveLength(6);
+    expect(result.skipped).toEqual([]);
   });
 
   it("limits Surge to conservative compatible protocols", () => {

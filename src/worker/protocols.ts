@@ -80,8 +80,13 @@ function query(values: Record<string, unknown>): string {
   return result ? `?${result}` : "";
 }
 
+function displayName(node: NodeRow): string {
+  const multiplier = Number(node.multiplier_bps || 10000) / 10000;
+  return multiplier === 1 ? node.name : `${node.name} [${Number(multiplier.toFixed(2))}x]`;
+}
+
 function clashNode(node: NodeRow, config: Config, credential: Credential): Config {
-  const base = { name: node.name, type: node.protocol === "shadowsocks" ? "ss" : node.protocol, server: config.server, port: config.port, udp: config.udp };
+  const base = { name: displayName(node), type: node.protocol === "shadowsocks" ? "ss" : node.protocol, server: config.server, port: config.port, udp: config.udp };
   switch (node.protocol) {
     case "shadowsocks": return { ...base, cipher: config.method, password: credential.secret, plugin: config.plugin, "plugin-opts": config.pluginOpts };
     case "vmess": return { ...base, uuid: credential.uuid, alterId: config.alterId, cipher: "auto", tls: config.tls, servername: config.sni, network: config.transport, "ws-opts": config.transport === "ws" ? { path: config.path || "/", headers: config.host ? { Host: config.host } : undefined } : undefined, "grpc-opts": config.transport === "grpc" ? { "grpc-service-name": config.serviceName || "" } : undefined };
@@ -93,7 +98,7 @@ function clashNode(node: NodeRow, config: Config, credential: Credential): Confi
 }
 
 function singboxNode(node: NodeRow, config: Config, credential: Credential): Config {
-  const base = { type: node.protocol, tag: node.name, server: config.server, server_port: config.port };
+  const base = { type: node.protocol, tag: displayName(node), server: config.server, server_port: config.port };
   const tls = config.tls || ["trojan", "hysteria2", "tuic"].includes(node.protocol)
     ? { enabled: true, server_name: config.sni || config.server, insecure: config.insecure || config.skipCertVerify }
     : undefined;
@@ -110,10 +115,10 @@ function singboxNode(node: NodeRow, config: Config, credential: Credential): Con
 
 function uri(node: NodeRow, config: Config, credential: Credential): string {
   const host = `${config.server}:${config.port}`;
-  const tag = `#${encodeURIComponent(node.name)}`;
+  const tag = `#${encodeURIComponent(displayName(node))}`;
   switch (node.protocol) {
     case "shadowsocks": return `ss://${encodeBase64(`${config.method}:${credential.secret}`).replace(/=+$/, "")}@${host}${tag}`;
-    case "vmess": return `vmess://${encodeBase64(JSON.stringify({ v: "2", ps: node.name, add: config.server, port: String(config.port), id: credential.uuid, aid: String(config.alterId || 0), scy: "auto", net: config.transport, type: "none", host: config.host || "", path: config.path || "", tls: config.tls ? "tls" : "", sni: config.sni || "" }))}`;
+    case "vmess": return `vmess://${encodeBase64(JSON.stringify({ v: "2", ps: displayName(node), add: config.server, port: String(config.port), id: credential.uuid, aid: String(config.alterId || 0), scy: "auto", net: config.transport, type: "none", host: config.host || "", path: config.path || "", tls: config.tls ? "tls" : "", sni: config.sni || "" }))}`;
     case "vless": return `vless://${credential.uuid}@${host}${query({ encryption: "none", security: config.realityPublicKey ? "reality" : config.tls ? "tls" : "none", type: config.transport, sni: config.sni, flow: config.flow, pbk: config.realityPublicKey, sid: config.shortId, path: config.path, host: config.host })}${tag}`;
     case "trojan": return `trojan://${encodeURIComponent(credential.secret)}@${host}${query({ security: "tls", sni: config.sni, type: config.transport, path: config.path, host: config.host, allowInsecure: config.skipCertVerify ? 1 : undefined })}${tag}`;
     case "hysteria2": return `hysteria2://${encodeURIComponent(credential.secret)}@${host}${query({ sni: config.sni, obfs: config.obfs, "obfs-password": config.obfsPassword, insecure: config.insecure ? 1 : undefined })}${tag}`;
@@ -124,10 +129,37 @@ function uri(node: NodeRow, config: Config, credential: Credential): string {
 export function renderSubscription(target: string, nodes: NodeRow[], credential: Credential) {
   const parsed = nodes.map((node) => ({ node, config: JSON.parse(node.config_json) as Config }));
   if (target === "clash") {
-    return { body: YAML.stringify({ proxies: parsed.map(({ node, config }) => clashNode(node, config, credential)) }), contentType: "text/yaml; charset=utf-8", skipped: [] as string[] };
+    const proxies = parsed.map(({ node, config }) => clashNode(node, config, credential));
+    const names = proxies.map((proxy) => String(proxy.name));
+    const groups = names.length ? [
+      { name: "Proxy", type: "select", proxies: ["Auto", ...names, "DIRECT"] },
+      { name: "Auto", type: "url-test", proxies: names, url: "https://www.gstatic.com/generate_204", interval: 300 },
+    ] : [{ name: "Proxy", type: "select", proxies: ["DIRECT"] }];
+    return { body: YAML.stringify({
+      "mixed-port": 7890, "allow-lan": false, mode: "rule", "log-level": "info", proxies,
+      "proxy-groups": groups,
+      rules: ["GEOIP,CN,DIRECT", "MATCH,Proxy"],
+    }), contentType: "text/yaml; charset=utf-8", skipped: [] as string[] };
   }
   if (target === "singbox") {
-    return { body: JSON.stringify({ outbounds: parsed.map(({ node, config }) => singboxNode(node, config, credential)) }, null, 2), contentType: "application/json; charset=utf-8", skipped: [] as string[] };
+    const nodeOutbounds = parsed.map(({ node, config }) => singboxNode(node, config, credential));
+    const tags = nodeOutbounds.map((outbound) => String(outbound.tag));
+    const routingOutbounds: Config[] = tags.length ? [
+      { type: "selector", tag: "Proxy", outbounds: ["Auto", ...tags, "direct"] },
+      { type: "urltest", tag: "Auto", outbounds: tags, url: "https://www.gstatic.com/generate_204", interval: "5m" },
+      { type: "direct", tag: "direct" },
+    ] : [{ type: "direct", tag: "Proxy" }];
+    return { body: JSON.stringify({
+      outbounds: [...nodeOutbounds, ...routingOutbounds],
+      route: {
+        rules: [{ action: "sniff" }, { ip_is_private: true, outbound: "direct" }, { rule_set: ["geosite-cn", "geoip-cn"], outbound: "direct" }],
+        rule_set: [
+          { type: "remote", tag: "geosite-cn", format: "binary", url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", download_detour: "Proxy" },
+          { type: "remote", tag: "geoip-cn", format: "binary", url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs", download_detour: "Proxy" },
+        ],
+        final: "Proxy",
+      },
+    }, null, 2), contentType: "application/json; charset=utf-8", skipped: [] as string[] };
   }
   if (target === "surge") {
     const supported = parsed.filter(({ node }) => node.protocol === "shadowsocks" || node.protocol === "trojan");
@@ -137,8 +169,11 @@ export function renderSubscription(target: string, nodes: NodeRow[], credential:
       : `${node.name} = trojan, ${config.server}, ${config.port}, password=${credential.secret}, sni=${config.sni || config.server}, skip-cert-verify=${config.skipCertVerify ? "true" : "false"}`);
     return { body: `[Proxy]\n${lines.join("\n")}\n`, contentType: "text/plain; charset=utf-8", skipped };
   }
+  if (target === "shadowrocket") {
+    return { body: encodeBase64(parsed.map(({ node, config }) => uri(node, config, credential)).join("\n")), contentType: "text/plain; charset=utf-8", skipped: [] as string[] };
+  }
   if (target === "base64") {
     return { body: encodeBase64(parsed.map(({ node, config }) => uri(node, config, credential)).join("\n")), contentType: "text/plain; charset=utf-8", skipped: [] as string[] };
   }
-  throw new Error("target 仅支持 clash、singbox、surge 或 base64");
+  throw new Error("target 仅支持 clash、shadowrocket、singbox、surge 或 base64");
 }

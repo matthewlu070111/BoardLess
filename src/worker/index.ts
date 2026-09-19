@@ -38,6 +38,12 @@ function publicUser(user: Awaited<ReturnType<typeof loadUser>>) {
   return { id: user.id, email: user.email, roles: user.roles, status: user.status, inviterAdminId: user.inviterAdminId };
 }
 
+async function nodeAuthorizationMode(env: Env): Promise<"plan" | "user"> {
+  const row = await env.DB.prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'node_authorization_mode'")
+    .first<{ setting_value: string }>();
+  return row?.setting_value === "user" ? "user" : "plan";
+}
+
 app.onError((error, c) => {
   console.error(error);
   const message = error instanceof Error ? error.message : "服务器错误";
@@ -164,7 +170,7 @@ app.get("/api/app/subscription", async (c) => {
   const active = await c.env.DB.prepare("SELECT 1 FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? LIMIT 1")
     .bind(user.id, now(), now()).first();
   const token = await signSubscriptionToken(c.env.SESSION_SECRET, user.id, user.subscriptionVersion);
-  return c.json({ active: Boolean(active), baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "singbox", "surge", "base64"] });
+  return c.json({ active: Boolean(active), baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "shadowrocket", "singbox", "surge"] });
 });
 
 app.post("/api/app/subscription/rotate", async (c) => {
@@ -803,6 +809,22 @@ app.get("/api/owner/overview", async (c) => {
   return c.json({ overview: result });
 });
 
+app.get("/api/owner/settings/node-authorization", async (c) => {
+  return c.json({ mode: await nodeAuthorizationMode(c.env) });
+});
+
+app.put("/api/owner/settings/node-authorization", async (c) => {
+  assertMutation(c);
+  const input = await body<{ mode: "plan" | "user" }>(c);
+  if (!(["plan", "user"] as string[]).includes(input.mode)) return c.json({ error: "节点授权模式无效" }, 400);
+  await c.env.DB.prepare(
+    `INSERT INTO system_settings (setting_key, setting_value, updated_by, updated_at) VALUES ('node_authorization_mode', ?, ?, ?)
+     ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+  ).bind(input.mode, c.get("user").id, now()).run();
+  await audit(c.env, c.get("user").id, "settings.node_authorization.update", "system_setting", "node_authorization_mode", { mode: input.mode });
+  return c.json({ ok: true, mode: input.mode });
+});
+
 app.get("/api/owner/nodes", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT n.*, u.email AS owner_email FROM nodes n JOIN users u ON u.id = n.owner_admin_id ORDER BY
@@ -847,6 +869,24 @@ app.patch("/api/owner/nodes/:id", async (c) => {
   return c.json({ ok: true, status: "approved" });
 });
 
+app.delete("/api/owner/nodes/:id", async (c) => {
+  assertMutation(c);
+  const id = c.req.param("id");
+  const node = await c.env.DB.prepare("SELECT id, name FROM nodes WHERE id = ?").bind(id).first<{ id: string; name: string }>();
+  if (!node) return c.json({ error: "节点不存在" }, 404);
+  const history = await c.env.DB.prepare("SELECT 1 FROM usage_entries WHERE node_id = ? LIMIT 1").bind(id).first();
+  if (history) return c.json({ error: "节点已有用量记录，不能删除；可改为归档以保留账务历史" }, 400);
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM plan_nodes WHERE node_id = ?").bind(id),
+    c.env.DB.prepare("DELETE FROM user_nodes WHERE node_id = ?").bind(id),
+    c.env.DB.prepare("DELETE FROM node_install_tokens WHERE node_id = ?").bind(id),
+    c.env.DB.prepare("DELETE FROM usage_reports WHERE node_id = ?").bind(id),
+    c.env.DB.prepare("DELETE FROM nodes WHERE id = ?").bind(id),
+  ]);
+  await audit(c.env, c.get("user").id, "node.delete", "node", id, { name: node.name });
+  return c.json({ ok: true });
+});
+
 app.post("/api/owner/nodes/:id/rotate-token", async (c) => {
   assertMutation(c);
   const owner = c.get("user");
@@ -875,21 +915,40 @@ app.post("/api/owner/nodes/:id/action", async (c) => {
 });
 
 app.get("/api/owner/plans", async (c) => {
-  const rows = await c.env.DB.prepare(
-    `SELECT p.*, GROUP_CONCAT(pn.node_id) AS node_ids FROM plans p LEFT JOIN plan_nodes pn ON pn.plan_id = p.id GROUP BY p.id ORDER BY p.created_at DESC`,
-  ).all<Record<string, unknown>>();
-  return c.json({ plans: rows.results.map((row) => ({ ...row, nodeIds: row.node_ids ? String(row.node_ids).split(",") : [], node_ids: undefined })) });
+  const [plans, assignments] = await Promise.all([
+    c.env.DB.prepare("SELECT * FROM plans ORDER BY created_at DESC").all<Record<string, unknown>>(),
+    c.env.DB.prepare("SELECT plan_id, node_id, multiplier_bps FROM plan_nodes ORDER BY node_id").all<Record<string, unknown>>(),
+  ]);
+  return c.json({ plans: plans.results.map((plan) => ({
+    ...plan,
+    nodes: assignments.results.filter((item) => item.plan_id === plan.id).map((item) => ({ nodeId: item.node_id, multiplier: Number(item.multiplier_bps) / 10000 })),
+    nodeIds: assignments.results.filter((item) => item.plan_id === plan.id).map((item) => item.node_id),
+  })) });
 });
+
+type NodeAssignmentInput = { nodeId: string; multiplier?: number };
+
+function normalizeNodeAssignments(assignments: NodeAssignmentInput[] | undefined, legacyIds: string[] | undefined): Array<{ nodeId: string; multiplierBps: number }> {
+  const source = assignments || (legacyIds || []).map((nodeId) => ({ nodeId, multiplier: 1 }));
+  const unique = new Map<string, number>();
+  for (const item of source) {
+    const multiplier = Number(item.multiplier ?? 1);
+    if (!item.nodeId || !Number.isFinite(multiplier) || multiplier <= 0 || multiplier > 100) throw new Error("节点倍率必须大于 0 且不超过 100");
+    unique.set(item.nodeId, Math.round(multiplier * 10000));
+  }
+  return [...unique].map(([nodeId, multiplierBps]) => ({ nodeId, multiplierBps }));
+}
 
 app.post("/api/owner/plans", async (c) => {
   assertMutation(c);
-  const input = await body<{ name: string; description?: string; priceCents: number; durationDays: number; quotaBytes: number; nodePoolBps?: number; nodeIds?: string[] }>(c);
+  const input = await body<{ name: string; description?: string; priceCents: number; durationDays: number; quotaBytes: number; nodePoolBps?: number; nodes?: NodeAssignmentInput[]; nodeIds?: string[] }>(c);
   const price = Math.floor(Number(input.priceCents));
   const duration = Math.floor(Number(input.durationDays));
   const quota = Math.floor(Number(input.quotaBytes));
   const pool = Math.floor(Number(input.nodePoolBps || 0));
   if (!input.name?.trim() || price < 0 || duration < 1 || quota < 1 || pool < 0 || pool > 10000) return c.json({ error: "套餐参数无效" }, 400);
-  const nodeIds = [...new Set(input.nodeIds || [])];
+  const nodeAssignments = normalizeNodeAssignments(input.nodes, input.nodeIds);
+  const nodeIds = nodeAssignments.map((item) => item.nodeId);
   if (nodeIds.length) {
     const placeholders = nodeIds.map(() => "?").join(",");
     const count = await c.env.DB.prepare(`SELECT COUNT(*) AS count FROM nodes WHERE status = 'approved' AND id IN (${placeholders})`).bind(...nodeIds).first<{ count: number }>();
@@ -899,7 +958,7 @@ app.post("/api/owner/plans", async (c) => {
   await c.env.DB.batch([
     c.env.DB.prepare("INSERT INTO plans (id, name, description, price_cents, duration_days, quota_bytes, node_pool_bps, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .bind(id, input.name.trim(), input.description?.trim() || "", price, duration, quota, pool, now(), now()),
-    ...nodeIds.map((nodeId) => c.env.DB.prepare("INSERT INTO plan_nodes (plan_id, node_id) VALUES (?, ?)").bind(id, nodeId)),
+    ...nodeAssignments.map((item) => c.env.DB.prepare("INSERT INTO plan_nodes (plan_id, node_id, multiplier_bps) VALUES (?, ?, ?)").bind(id, item.nodeId, item.multiplierBps)),
   ]);
   await audit(c.env, c.get("user").id, "plan.create", "plan", id);
   return c.json({ id }, 201);
@@ -907,10 +966,11 @@ app.post("/api/owner/plans", async (c) => {
 
 app.patch("/api/owner/plans/:id", async (c) => {
   assertMutation(c);
-  const input = await body<{ name: string; description?: string; priceCents: number; durationDays: number; quotaBytes: number; nodePoolBps?: number; nodeIds?: string[]; status?: "active" | "archived" }>(c);
+  const input = await body<{ name: string; description?: string; priceCents: number; durationDays: number; quotaBytes: number; nodePoolBps?: number; nodes?: NodeAssignmentInput[]; nodeIds?: string[]; status?: "active" | "archived" }>(c);
   const plan = await c.env.DB.prepare("SELECT id FROM plans WHERE id = ?").bind(c.req.param("id")).first();
   if (!plan) return c.json({ error: "套餐不存在" }, 404);
-  const nodeIds = [...new Set(input.nodeIds || [])];
+  const nodeAssignments = normalizeNodeAssignments(input.nodes, input.nodeIds);
+  const nodeIds = nodeAssignments.map((item) => item.nodeId);
   const price = Math.floor(Number(input.priceCents));
   const duration = Math.floor(Number(input.durationDays));
   const quota = Math.floor(Number(input.quotaBytes));
@@ -927,7 +987,7 @@ app.patch("/api/owner/plans/:id", async (c) => {
     c.env.DB.prepare("UPDATE plans SET name = ?, description = ?, price_cents = ?, duration_days = ?, quota_bytes = ?, node_pool_bps = ?, status = ?, updated_at = ? WHERE id = ?")
       .bind(input.name.trim(), input.description?.trim() || "", price, duration, quota, pool, input.status || "active", now(), c.req.param("id")),
     c.env.DB.prepare("DELETE FROM plan_nodes WHERE plan_id = ?").bind(c.req.param("id")),
-    ...nodeIds.map((nodeId) => c.env.DB.prepare("INSERT INTO plan_nodes (plan_id, node_id) SELECT ?, id FROM nodes WHERE id = ? AND status = 'approved'").bind(c.req.param("id"), nodeId)),
+    ...nodeAssignments.map((item) => c.env.DB.prepare("INSERT INTO plan_nodes (plan_id, node_id, multiplier_bps) SELECT ?, id, ? FROM nodes WHERE id = ? AND status = 'approved'").bind(c.req.param("id"), item.multiplierBps, item.nodeId)),
   ];
   await c.env.DB.batch(statements);
   await audit(c.env, c.get("user").id, "plan.update", "plan", c.req.param("id"));
@@ -937,18 +997,27 @@ app.patch("/api/owner/plans/:id", async (c) => {
 app.get("/api/owner/users", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.status, u.inviter_admin_id, u.created_at, GROUP_CONCAT(ur.role) AS roles,
-      inviter.email AS inviter_email, ap.commission_bps FROM users u JOIN user_roles ur ON ur.user_id = u.id
+      inviter.email AS inviter_email, ap.commission_bps,
+      (SELECT COALESCE(SUM(w.amount_cents), 0) FROM wallet_ledger w WHERE w.user_id = u.id) AS wallet_cents
+      FROM users u JOIN user_roles ur ON ur.user_id = u.id
       LEFT JOIN users inviter ON inviter.id = u.inviter_admin_id LEFT JOIN admin_profiles ap ON ap.user_id = u.id
       GROUP BY u.id ORDER BY u.created_at DESC LIMIT 500`,
   ).all<Record<string, unknown>>();
-  return c.json({ users: rows.results.map((row) => ({ ...row, roles: String(row.roles).split(",") })) });
+  const grants = await c.env.DB.prepare("SELECT user_id, node_id, multiplier_bps FROM user_nodes ORDER BY node_id").all<Record<string, unknown>>();
+  return c.json({ users: rows.results.map((row) => ({
+    ...row, roles: String(row.roles).split(","),
+    nodes: grants.results.filter((grant) => grant.user_id === row.id).map((grant) => ({ nodeId: grant.node_id, multiplier: Number(grant.multiplier_bps) / 10000 })),
+  })) });
 });
 
 app.patch("/api/owner/users/:id", async (c) => {
   assertMutation(c);
-  const input = await body<{ status?: "active" | "disabled"; commissionBps?: number }>(c);
+  const input = await body<{ status?: "active" | "disabled"; commissionBps?: number; walletCents?: number; nodes?: NodeAssignmentInput[] }>(c);
   const targetId = c.req.param("id");
+  const target = await c.env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(targetId).first();
+  if (!target) return c.json({ error: "用户不存在" }, 404);
   if (targetId === c.get("user").id && input.status === "disabled") return c.json({ error: "不能停用当前站长账号" }, 400);
+  if (input.status && !["active", "disabled"].includes(input.status)) return c.json({ error: "用户状态无效" }, 400);
   if (input.status) {
     await c.env.DB.prepare("UPDATE users SET status = ? WHERE id = ?").bind(input.status, targetId).run();
     await c.env.DB.prepare("UPDATE admin_profiles SET disabled_at = ? WHERE user_id = ?").bind(input.status === "disabled" ? now() : null, targetId).run();
@@ -957,6 +1026,28 @@ app.patch("/api/owner/users/:id", async (c) => {
     const bps = Math.floor(Number(input.commissionBps));
     if (bps < 0 || bps > 10000) return c.json({ error: "佣金比例无效" }, 400);
     await c.env.DB.prepare("UPDATE admin_profiles SET commission_bps = ? WHERE user_id = ?").bind(bps, targetId).run();
+  }
+  if (input.walletCents !== undefined) {
+    const desired = Math.floor(Number(input.walletCents));
+    if (!Number.isSafeInteger(desired) || desired < 0 || desired > 100_000_000_00) return c.json({ error: "余额金额无效" }, 400);
+    const current = await walletBalance(c.env, targetId);
+    const difference = desired - current;
+    if (difference) await c.env.DB.prepare(
+      "INSERT INTO wallet_ledger (id, user_id, kind, amount_cents, created_at) SELECT ?, id, 'owner_adjustment', ?, ? FROM users WHERE id = ?",
+    ).bind(newId("wallet"), difference, now(), targetId).run();
+  }
+  if (input.nodes !== undefined) {
+    const assignments = normalizeNodeAssignments(input.nodes, undefined);
+    const nodeIds = assignments.map((item) => item.nodeId);
+    if (nodeIds.length) {
+      const placeholders = nodeIds.map(() => "?").join(",");
+      const count = await c.env.DB.prepare(`SELECT COUNT(*) AS count FROM nodes WHERE status = 'approved' AND id IN (${placeholders})`).bind(...nodeIds).first<{ count: number }>();
+      if (Number(count?.count) !== nodeIds.length) return c.json({ error: "只能给用户分配已审核节点" }, 400);
+    }
+    await c.env.DB.batch([
+      c.env.DB.prepare("DELETE FROM user_nodes WHERE user_id = ?").bind(targetId),
+      ...assignments.map((item) => c.env.DB.prepare("INSERT INTO user_nodes (user_id, node_id, multiplier_bps, created_at, created_by) SELECT id, ?, ?, ?, ? FROM users WHERE id = ?").bind(item.nodeId, item.multiplierBps, now(), c.get("user").id, targetId)),
+    ]);
   }
   await audit(c.env, c.get("user").id, "user.update", "user", targetId, input);
   return c.json({ ok: true });
@@ -1083,16 +1174,18 @@ app.get("/api/node/v1/config", async (c) => {
   const node = await nodeFromRequest(c.env, c.req.header("Authorization"));
   if (!node) return c.json({ error: "节点令牌无效" }, 401);
   const timestamp = now();
+  const authorizationMode = await nodeAuthorizationMode(c.env);
   const users = node.status === "approved" ? await c.env.DB.prepare(
     `SELECT DISTINCT u.id, u.access_uuid, u.access_secret, e.ends_at, e.quota_bytes,
       COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
      FROM entitlements e
      JOIN users u ON u.id = e.user_id
-     JOIN plan_nodes pn ON pn.plan_id = e.plan_id AND pn.node_id = ?
      LEFT JOIN quota_usage q ON q.user_id = u.id AND q.month_key = ?
      WHERE e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? AND u.status = 'active'
+       AND ((? = 'plan' AND EXISTS (SELECT 1 FROM plan_nodes pn WHERE pn.plan_id = e.plan_id AND pn.node_id = ?))
+         OR (? = 'user' AND EXISTS (SELECT 1 FROM user_nodes un WHERE un.user_id = u.id AND un.node_id = ?)))
        AND COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) < e.quota_bytes`,
-  ).bind(node.id, monthKey(), timestamp, timestamp).all<Record<string, unknown>>() : { results: [] };
+  ).bind(monthKey(), timestamp, timestamp, authorizationMode, node.id, authorizationMode, node.id).all<Record<string, unknown>>() : { results: [] };
   return c.json({
     node: { id: node.id, name: node.name, protocol: node.protocol, status: node.status, config: JSON.parse(node.config_json), updatedAt: node.updated_at },
     users: users.results.map((user) => ({ id: user.id, uuid: user.access_uuid, secret: user.access_secret, expiresAt: user.ends_at, quotaBytes: user.quota_bytes, usedBytes: user.used_bytes })),
@@ -1121,6 +1214,7 @@ app.post("/api/node/v1/usage", async (c) => {
   const duplicate = await c.env.DB.prepare("SELECT 1 FROM usage_reports WHERE node_id = ? AND report_id = ?").bind(node.id, input.reportId).first();
   if (duplicate) return c.json({ accepted: false, duplicate: true });
   const timestamp = now();
+  const authorizationMode = await nodeAuthorizationMode(c.env);
   const statements: D1PreparedStatement[] = [
     c.env.DB.prepare("INSERT INTO usage_reports (report_id, node_id, reported_at) VALUES (?, ?, ?)").bind(input.reportId, node.id, timestamp),
   ];
@@ -1130,17 +1224,24 @@ app.post("/api/node/v1/usage", async (c) => {
     const down = Math.floor(Number(entry.downBytes));
     if (!entry.userId || !Number.isSafeInteger(up) || !Number.isSafeInteger(down) || up < 0 || down < 0 || up + down === 0) continue;
     const entitlement = await c.env.DB.prepare(
-      `SELECT e.id FROM entitlements e JOIN plan_nodes pn ON pn.plan_id = e.plan_id
-       WHERE e.user_id = ? AND pn.node_id = ? AND e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? LIMIT 1`,
-    ).bind(entry.userId, node.id, timestamp, timestamp).first<{ id: string }>();
+      `SELECT e.id, CASE WHEN ? = 'plan'
+          THEN COALESCE((SELECT pn.multiplier_bps FROM plan_nodes pn WHERE pn.plan_id = e.plan_id AND pn.node_id = ?), 0)
+          ELSE COALESCE((SELECT un.multiplier_bps FROM user_nodes un WHERE un.user_id = e.user_id AND un.node_id = ?), 0)
+        END AS multiplier_bps FROM entitlements e
+       WHERE e.user_id = ? AND e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ?
+         AND ((? = 'plan' AND EXISTS (SELECT 1 FROM plan_nodes pn WHERE pn.plan_id = e.plan_id AND pn.node_id = ?))
+           OR (? = 'user' AND EXISTS (SELECT 1 FROM user_nodes un WHERE un.user_id = e.user_id AND un.node_id = ?))) LIMIT 1`,
+    ).bind(authorizationMode, node.id, node.id, entry.userId, timestamp, timestamp, authorizationMode, node.id, authorizationMode, node.id).first<{ id: string; multiplier_bps: number }>();
     if (!entitlement) continue;
+    const chargedUp = Math.floor(up * Number(entitlement.multiplier_bps || 10000) / 10000);
+    const chargedDown = Math.floor(down * Number(entitlement.multiplier_bps || 10000) / 10000);
     statements.push(
       c.env.DB.prepare("INSERT INTO usage_entries (id, report_id, node_id, user_id, entitlement_id, up_bytes, down_bytes, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(newId("usage"), input.reportId, node.id, entry.userId, entitlement.id, up, down, timestamp),
       c.env.DB.prepare(
         `INSERT INTO quota_usage (user_id, month_key, up_bytes, down_bytes) VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, month_key) DO UPDATE SET up_bytes = up_bytes + excluded.up_bytes, down_bytes = down_bytes + excluded.down_bytes`,
-      ).bind(entry.userId, monthKey(timestamp), up, down),
+      ).bind(entry.userId, monthKey(timestamp), chargedUp, chargedDown),
     );
     accepted++;
   }
@@ -1166,12 +1267,17 @@ app.get("/sub/:token", async (c) => {
   const usage = await c.env.DB.prepare("SELECT up_bytes + down_bytes AS used FROM quota_usage WHERE user_id = ? AND month_key = ?")
     .bind(user.id, monthKey(timestamp)).first<{ used: number }>();
   if (Number(usage?.used || 0) >= entitlement.quota_bytes) return c.text("本月流量已用尽", 403);
+  const authorizationMode = await nodeAuthorizationMode(c.env);
+  const accessSql = authorizationMode === "plan"
+    ? "SELECT node_id, multiplier_bps FROM plan_nodes WHERE plan_id = ?"
+    : "SELECT node_id, multiplier_bps FROM user_nodes WHERE user_id = ?";
   const nodes = await c.env.DB.prepare(
-    `SELECT n.* FROM nodes n JOIN plan_nodes pn ON pn.node_id = n.id
+    `SELECT n.*, access.multiplier_bps FROM nodes n JOIN (${accessSql}) access ON access.node_id = n.id
      JOIN users owner ON owner.id = n.owner_admin_id
      LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
-     WHERE pn.plan_id = ? AND n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL ORDER BY n.name`,
-  ).bind(entitlement.plan_id).all<NodeRow>();
+     WHERE n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL
+     ORDER BY n.name`,
+  ).bind(authorizationMode === "plan" ? entitlement.plan_id : user.id).all<NodeRow>();
   try {
     const result = renderSubscription(c.req.query("target") || "clash", nodes.results, { uuid: user.accessUuid, secret: user.accessSecret });
     const headers = new Headers({ "content-type": result.contentType, "cache-control": "no-store, private", "subscription-userinfo": `upload=${Number(usage?.used || 0)}; download=0; total=${entitlement.quota_bytes}` });

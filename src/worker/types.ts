@@ -42,6 +42,7 @@ export interface NodeRow {
   agent_version: string | null;
   created_at: number;
   updated_at: number;
+  multiplier_bps?: number;
 }
 
 export interface PlanRow {

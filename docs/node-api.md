@@ -40,7 +40,7 @@ Authorization: Bearer <node-token>
 
 `GET /api/node/v1/config`
 
-返回节点协议配置和获得该节点授权的用户。站长选择“按套餐授权”时，仅返回套餐有效且自然月流量未超额的用户；选择“按用户直接授权”时，按逐个节点分配关系返回用户，不要求套餐：
+返回节点协议配置和获得该节点授权的用户。套餐运营模式只返回套餐有效且自然月流量未超额的用户；逐节点授权模式按站长配置的用户-节点授权返回用户，不要求套餐：
 
 ```json
 {
@@ -64,7 +64,7 @@ Authorization: Bearer <node-token>
 }
 ```
 
-直接授权模式下会额外返回 `"authorizationMode": "user"`，用户项中 `expiresAt` 与 `quotaBytes` 为 `null`，并以 `"unlimited": true` 表示不使用套餐期限及套餐流量额度。
+响应中的 `siteMode` 为 `plan` 或 `direct`。逐节点授权模式下，每个用户会返回独立的 `expiresAt`、`quotaBytes`、`quotaCycle` 与 `usedBytes`；不限期或不限量时对应字段为 `null`，期限和额度都不限时 `unlimited` 为 `true`。
 
 节点端负责把 `uuid` 或 `secret` 写入实际协议服务。面板不启动或管理代理进程。
 

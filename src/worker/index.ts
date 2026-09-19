@@ -1,6 +1,6 @@
 import { Context, Hono } from "hono";
 import { cors } from "hono/cors";
-import { audit, earningsBalance, monthKey, newId, now, randomToken, sha256, walletBalance } from "./db";
+import { audit, earningsBalance, monthKey, monthStart, newId, now, randomToken, sha256, walletBalance } from "./db";
 import {
   authMiddleware, checkLoginRate, createSession, createUser, destroySession, loadUser, requireRole,
   signSubscriptionToken, verifyPassword, verifySubscriptionToken,
@@ -38,16 +38,76 @@ function publicUser(user: Awaited<ReturnType<typeof loadUser>>) {
   return { id: user.id, email: user.email, roles: user.roles, status: user.status, inviterAdminId: user.inviterAdminId };
 }
 
-async function nodeAuthorizationMode(env: Env): Promise<"plan" | "user"> {
-  const row = await env.DB.prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'node_authorization_mode'")
+type SiteMode = "plan" | "direct";
+
+async function siteMode(env: Env): Promise<SiteMode> {
+  const row = await env.DB.prepare("SELECT setting_value FROM system_settings WHERE setting_key = 'site_mode'")
     .first<{ setting_value: string }>();
-  return row?.setting_value === "user" ? "user" : "plan";
+  return row?.setting_value === "direct" ? "direct" : "plan";
+}
+
+async function requireSiteMode(c: Context<App>, expected: SiteMode) {
+  const current = await siteMode(c.env);
+  if (current !== expected) throw new Error(expected === "plan" ? "当前站点为逐节点授权模式，此功能不可用" : "当前站点为套餐运营模式，此功能不可用");
+}
+
+interface DirectGrantRow {
+  user_id: string;
+  node_id: string;
+  multiplier_bps: number;
+  created_at: number;
+  expires_at: number | null;
+  quota_bytes: number | null;
+  quota_cycle: "monthly" | "total" | null;
+  grant_key: string;
+  used_bytes: number;
+  node_name?: string;
+  protocol?: Protocol;
+  node_status?: string;
+  node_owner_status?: string;
+  node_owner_disabled_at?: number | null;
+  user_status?: string;
+  access_uuid?: string;
+  access_secret?: string;
+}
+
+async function directGrants(env: Env, filters: { userId?: string; nodeId?: string } = {}): Promise<DirectGrantRow[]> {
+  const clauses: string[] = [];
+  const bindings: unknown[] = [monthStart()];
+  if (filters.userId) { clauses.push("un.user_id = ?"); bindings.push(filters.userId); }
+  if (filters.nodeId) { clauses.push("un.node_id = ?"); bindings.push(filters.nodeId); }
+  const rows = await env.DB.prepare(
+    `SELECT un.*, n.name AS node_name, n.protocol, n.status AS node_status,
+      owner.status AS node_owner_status, ap.disabled_at AS node_owner_disabled_at,
+      granted.status AS user_status, granted.access_uuid, granted.access_secret,
+      COALESCE((SELECT SUM(d.charged_up_bytes + d.charged_down_bytes) FROM direct_usage_entries d
+        WHERE d.grant_key = un.grant_key
+          AND d.observed_at >= CASE WHEN un.quota_cycle = 'monthly' THEN MAX(un.created_at, ?) ELSE un.created_at END), 0) AS used_bytes
+     FROM user_nodes un JOIN nodes n ON n.id = un.node_id JOIN users owner ON owner.id = n.owner_admin_id
+     JOIN users granted ON granted.id = un.user_id
+     LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
+     ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
+     ORDER BY n.name`,
+  ).bind(...bindings).all<DirectGrantRow>();
+  return rows.results;
+}
+
+function directGrantWithinLimits(grant: DirectGrantRow, timestamp = now()): boolean {
+  return (!grant.expires_at || grant.expires_at > timestamp) && (!grant.quota_bytes || Number(grant.used_bytes) < grant.quota_bytes);
+}
+
+function directGrantActive(grant: DirectGrantRow, timestamp = now()): boolean {
+  return directGrantWithinLimits(grant, timestamp)
+    && grant.node_status === "approved"
+    && grant.node_owner_status === "active"
+    && grant.node_owner_disabled_at == null
+    && grant.user_status === "active";
 }
 
 app.onError((error, c) => {
   console.error(error);
   const message = error instanceof Error ? error.message : "服务器错误";
-  const status = /不存在|无效|不能为空|必须|仅支持|不受支持|不足|过期|已被|缺少|不匹配|不一致|不能|超过|重复|只允许|占用|发生变化/.test(message) ? 400 : 500;
+  const status = /不存在|无效|不能为空|必须|仅支持|不受支持|不可用|不足|过期|已被|缺少|不匹配|不一致|不能|超过|重复|只允许|占用|发生变化/.test(message) ? 400 : 500;
   return c.json({ error: message }, status);
 });
 
@@ -124,7 +184,7 @@ app.post("/api/invitations/:token/accept", async (c) => {
 });
 
 app.use("/api/me", authMiddleware);
-app.get("/api/me", async (c) => c.json({ user: publicUser(c.get("user")) }));
+app.get("/api/me", async (c) => c.json({ user: publicUser(c.get("user")), siteMode: await siteMode(c.env) }));
 
 app.use("/api/app/*", authMiddleware);
 app.use("/api/admin/*", authMiddleware, requireRole("admin"));
@@ -134,18 +194,28 @@ app.use("/api/deploy/*", authMiddleware, requireRole("admin", "owner"));
 app.get("/api/app/dashboard", async (c) => {
   const user = c.get("user");
   const timestamp = now();
+  const mode = await siteMode(c.env);
+  const orderCount = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM orders WHERE user_id = ?")
+    .bind(user.id).first<{ count: number }>();
+  if (mode === "direct") {
+    const grants = await directGrants(c.env, { userId: user.id });
+    return c.json({ siteMode: mode, grants: grants.map((grant) => ({
+      nodeId: grant.node_id, name: grant.node_name, protocol: grant.protocol, multiplier: grant.multiplier_bps / 10000,
+      expiresAt: grant.expires_at, quotaBytes: grant.quota_bytes, quotaCycle: grant.quota_cycle,
+      usedBytes: Number(grant.used_bytes), active: directGrantActive(grant, timestamp),
+    })), orderCount: orderCount?.count || 0 });
+  }
   const entitlement = await c.env.DB.prepare(
     `SELECT e.*, p.name AS plan_name FROM entitlements e JOIN plans p ON p.id = e.plan_id
      WHERE e.user_id = ? AND e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? ORDER BY e.ends_at DESC LIMIT 1`,
   ).bind(user.id, timestamp, timestamp).first<Record<string, unknown>>();
   const usage = await c.env.DB.prepare("SELECT up_bytes, down_bytes FROM quota_usage WHERE user_id = ? AND month_key = ?")
     .bind(user.id, monthKey()).first<{ up_bytes: number; down_bytes: number }>();
-  const orderCount = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM orders WHERE user_id = ?")
-    .bind(user.id).first<{ count: number }>();
-  return c.json({ entitlement, usage: usage || { up_bytes: 0, down_bytes: 0 }, walletCents: await walletBalance(c.env, user.id), orderCount: orderCount?.count || 0 });
+  return c.json({ siteMode: mode, entitlement, usage: usage || { up_bytes: 0, down_bytes: 0 }, walletCents: await walletBalance(c.env, user.id), orderCount: orderCount?.count || 0 });
 });
 
 app.get("/api/app/plans", async (c) => {
+  await requireSiteMode(c, "plan");
   const plans = await c.env.DB.prepare(
     "SELECT p.*, COUNT(pn.node_id) AS node_count FROM plans p LEFT JOIN plan_nodes pn ON pn.plan_id = p.id WHERE p.status = 'active' GROUP BY p.id ORDER BY p.price_cents",
   ).all<PlanRow & { node_count: number }>();
@@ -160,23 +230,30 @@ app.get("/api/app/orders", async (c) => {
 });
 
 app.get("/api/app/usage", async (c) => {
+  if (await siteMode(c.env) === "direct") {
+    const rows = await c.env.DB.prepare(
+      `SELECT d.node_id, n.name AS node_name,
+        strftime('%Y-%m', d.observed_at, 'unixepoch', '+8 hours') AS month_key,
+        SUM(d.up_bytes) AS up_bytes, SUM(d.down_bytes) AS down_bytes,
+        SUM(d.charged_up_bytes) AS charged_up_bytes, SUM(d.charged_down_bytes) AS charged_down_bytes
+       FROM direct_usage_entries d JOIN nodes n ON n.id = d.node_id
+       WHERE d.user_id = ? GROUP BY d.node_id, month_key ORDER BY month_key DESC, n.name LIMIT 120`,
+    ).bind(c.get("user").id).all();
+    return c.json({ siteMode: "direct", usage: rows.results });
+  }
   const rows = await c.env.DB.prepare("SELECT month_key, up_bytes, down_bytes FROM quota_usage WHERE user_id = ? ORDER BY month_key DESC LIMIT 12")
     .bind(c.get("user").id).all();
-  return c.json({ usage: rows.results });
+  return c.json({ siteMode: "plan", usage: rows.results });
 });
 
 app.get("/api/app/subscription", async (c) => {
   const user = c.get("user");
-  const authorizationMode = await nodeAuthorizationMode(c.env);
-  const active = authorizationMode === "plan"
+  const mode = await siteMode(c.env);
+  const active = mode === "plan"
     ? await c.env.DB.prepare("SELECT 1 FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? LIMIT 1").bind(user.id, now(), now()).first()
-    : await c.env.DB.prepare(
-      `SELECT 1 FROM user_nodes un JOIN nodes n ON n.id = un.node_id JOIN users owner ON owner.id = n.owner_admin_id
-       LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
-       WHERE un.user_id = ? AND n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL LIMIT 1`,
-    ).bind(user.id).first();
+    : (await directGrants(c.env, { userId: user.id })).some((grant) => directGrantActive(grant));
   const token = await signSubscriptionToken(c.env.SESSION_SECRET, user.id, user.subscriptionVersion);
-  return c.json({ active: Boolean(active), authorizationMode, baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "shadowrocket", "singbox", "surge"] });
+  return c.json({ active: Boolean(active), siteMode: mode, baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "shadowrocket", "singbox", "surge"] });
 });
 
 app.post("/api/app/subscription/rotate", async (c) => {
@@ -266,6 +343,7 @@ async function activateOrder(env: Env, orderId: string, tradeNo: string | null) 
 
 app.post("/api/app/orders", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const user = c.get("user");
   const input = await body<{ planId: string }>(c);
   const plan = await c.env.DB.prepare("SELECT * FROM plans WHERE id = ? AND status = 'active'").bind(input.planId).first<PlanRow>();
@@ -325,6 +403,7 @@ app.get("/api/app/orders/:id", async (c) => {
 
 app.post("/api/app/orders/:id/query", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const user = c.get("user");
   const order = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ? AND user_id = ?").bind(c.req.param("id"), user.id).first<OrderRecord>();
   if (!order) return c.json({ error: "订单不存在" }, 404);
@@ -778,6 +857,7 @@ app.get("/api/admin/withdrawals", async (c) => {
 
 app.post("/api/admin/withdrawals", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const user = c.get("user");
   const input = await body<{ amountCents: number; alipayAccount: string }>(c);
   const amount = Math.floor(Number(input.amountCents));
@@ -815,20 +895,45 @@ app.get("/api/owner/overview", async (c) => {
   return c.json({ overview: result });
 });
 
-app.get("/api/owner/settings/node-authorization", async (c) => {
-  return c.json({ mode: await nodeAuthorizationMode(c.env) });
+async function siteModeBlockers(env: Env, current: SiteMode) {
+  if (current === "plan") {
+    const timestamp = now();
+    const row = await env.DB.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM entitlements WHERE status = 'active' AND ends_at > ?) AS entitlements,
+        (SELECT COUNT(*) FROM orders WHERE status IN ('pending', 'review')) AS orders,
+        (SELECT COUNT(*) FROM withdrawals WHERE status = 'pending') AS withdrawals`,
+    ).bind(timestamp).first<{ entitlements: number; orders: number; withdrawals: number }>();
+    return { entitlements: Number(row?.entitlements || 0), orders: Number(row?.orders || 0), withdrawals: Number(row?.withdrawals || 0) };
+  }
+  const activeGrants = (await directGrants(env)).filter((grant) => directGrantWithinLimits(grant)).length;
+  return { grants: activeGrants };
+}
+
+function blockerCount(blockers: Record<string, number | undefined>) {
+  return Object.values(blockers).reduce<number>((sum, value) => sum + Number(value || 0), 0);
+}
+
+app.get("/api/owner/settings/site-mode", async (c) => {
+  const mode = await siteMode(c.env);
+  return c.json({ mode, blockers: await siteModeBlockers(c.env, mode) });
 });
 
-app.put("/api/owner/settings/node-authorization", async (c) => {
+app.put("/api/owner/settings/site-mode", async (c) => {
   assertMutation(c);
-  const input = await body<{ mode: "plan" | "user" }>(c);
-  if (!(["plan", "user"] as string[]).includes(input.mode)) return c.json({ error: "节点授权模式无效" }, 400);
-  await c.env.DB.prepare(
-    `INSERT INTO system_settings (setting_key, setting_value, updated_by, updated_at) VALUES ('node_authorization_mode', ?, ?, ?)
+  const input = await body<{ mode: SiteMode }>(c);
+  if (!(input.mode === "plan" || input.mode === "direct")) return c.json({ error: "站点模式无效" }, 400);
+  const current = await siteMode(c.env);
+  if (current === input.mode) return c.json({ ok: true, mode: current });
+  const blockers = await siteModeBlockers(c.env, current);
+  if (blockerCount(blockers)) return c.json({ error: "仍有未结业务，不能切换站点模式", blockers }, 409);
+  const changed = await c.env.DB.prepare(
+    `INSERT INTO system_settings (setting_key, setting_value, updated_by, updated_at) VALUES ('site_mode', ?, ?, ?)
      ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
   ).bind(input.mode, c.get("user").id, now()).run();
-  await audit(c.env, c.get("user").id, "settings.node_authorization.update", "system_setting", "node_authorization_mode", { mode: input.mode });
-  return c.json({ ok: true, mode: input.mode });
+  if (!changed.meta.changes) return c.json({ error: "站点模式切换失败" }, 409);
+  await audit(c.env, c.get("user").id, "settings.site_mode.update", "system_setting", "site_mode", { from: current, to: input.mode });
+  return c.json({ ok: true, mode: input.mode, blockers: {} });
 });
 
 app.get("/api/owner/nodes", async (c) => {
@@ -947,6 +1052,7 @@ function normalizeNodeAssignments(assignments: NodeAssignmentInput[] | undefined
 
 app.post("/api/owner/plans", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const input = await body<{ name: string; description?: string; priceCents: number; durationDays: number; quotaBytes: number; nodePoolBps?: number; nodes?: NodeAssignmentInput[]; nodeIds?: string[] }>(c);
   const price = Math.floor(Number(input.priceCents));
   const duration = Math.floor(Number(input.durationDays));
@@ -972,6 +1078,7 @@ app.post("/api/owner/plans", async (c) => {
 
 app.patch("/api/owner/plans/:id", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const input = await body<{ name: string; description?: string; priceCents: number; durationDays: number; quotaBytes: number; nodePoolBps?: number; nodes?: NodeAssignmentInput[]; nodeIds?: string[]; status?: "active" | "archived" }>(c);
   const plan = await c.env.DB.prepare("SELECT id FROM plans WHERE id = ?").bind(c.req.param("id")).first();
   if (!plan) return c.json({ error: "套餐不存在" }, 404);
@@ -1000,6 +1107,24 @@ app.patch("/api/owner/plans/:id", async (c) => {
   return c.json({ ok: true });
 });
 
+app.delete("/api/owner/plans/:id", async (c) => {
+  assertMutation(c);
+  await requireSiteMode(c, "plan");
+  const planId = c.req.param("id");
+  const plan = await c.env.DB.prepare("SELECT id FROM plans WHERE id = ?").bind(planId).first();
+  if (!plan) return c.json({ error: "套餐不存在" }, 404);
+  const references = await c.env.DB.prepare(
+    `SELECT (SELECT COUNT(*) FROM orders WHERE plan_id = ?) AS orders,
+      (SELECT COUNT(*) FROM entitlements WHERE plan_id = ?) AS entitlements`,
+  ).bind(planId, planId).first<{ orders: number; entitlements: number }>();
+  if (Number(references?.orders || 0) > 0 || Number(references?.entitlements || 0) > 0) {
+    return c.json({ error: "套餐已有订单或权益历史，不能删除；请改为归档" }, 409);
+  }
+  await c.env.DB.prepare("DELETE FROM plans WHERE id = ?").bind(planId).run();
+  await audit(c.env, c.get("user").id, "plan.delete", "plan", planId);
+  return c.json({ ok: true });
+});
+
 app.get("/api/owner/users", async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT u.id, u.email, u.status, u.inviter_admin_id, u.created_at, GROUP_CONCAT(ur.role) AS roles,
@@ -1009,16 +1134,12 @@ app.get("/api/owner/users", async (c) => {
       LEFT JOIN users inviter ON inviter.id = u.inviter_admin_id LEFT JOIN admin_profiles ap ON ap.user_id = u.id
       GROUP BY u.id ORDER BY u.created_at DESC LIMIT 500`,
   ).all<Record<string, unknown>>();
-  const grants = await c.env.DB.prepare("SELECT user_id, node_id, multiplier_bps FROM user_nodes ORDER BY node_id").all<Record<string, unknown>>();
-  return c.json({ users: rows.results.map((row) => ({
-    ...row, roles: String(row.roles).split(","),
-    nodes: grants.results.filter((grant) => grant.user_id === row.id).map((grant) => ({ nodeId: grant.node_id, multiplier: Number(grant.multiplier_bps) / 10000 })),
-  })) });
+  return c.json({ users: rows.results.map((row) => ({ ...row, roles: String(row.roles).split(",") })) });
 });
 
 app.patch("/api/owner/users/:id", async (c) => {
   assertMutation(c);
-  const input = await body<{ status?: "active" | "disabled"; commissionBps?: number; walletCents?: number; nodes?: NodeAssignmentInput[] }>(c);
+  const input = await body<{ status?: "active" | "disabled"; commissionBps?: number; walletCents?: number }>(c);
   const targetId = c.req.param("id");
   const target = await c.env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(targetId).first();
   if (!target) return c.json({ error: "用户不存在" }, 404);
@@ -1042,21 +1163,101 @@ app.patch("/api/owner/users/:id", async (c) => {
       "INSERT INTO wallet_ledger (id, user_id, kind, amount_cents, created_at) SELECT ?, id, 'owner_adjustment', ?, ? FROM users WHERE id = ?",
     ).bind(newId("wallet"), difference, now(), targetId).run();
   }
-  if (input.nodes !== undefined) {
-    const assignments = normalizeNodeAssignments(input.nodes, undefined);
-    const nodeIds = assignments.map((item) => item.nodeId);
-    if (nodeIds.length) {
-      const placeholders = nodeIds.map(() => "?").join(",");
-      const count = await c.env.DB.prepare(`SELECT COUNT(*) AS count FROM nodes WHERE status = 'approved' AND id IN (${placeholders})`).bind(...nodeIds).first<{ count: number }>();
-      if (Number(count?.count) !== nodeIds.length) return c.json({ error: "只能给用户分配已审核节点" }, 400);
-    }
-    await c.env.DB.batch([
-      c.env.DB.prepare("DELETE FROM user_nodes WHERE user_id = ?").bind(targetId),
-      ...assignments.map((item) => c.env.DB.prepare("INSERT INTO user_nodes (user_id, node_id, multiplier_bps, created_at, created_by) SELECT id, ?, ?, ?, ? FROM users WHERE id = ?").bind(item.nodeId, item.multiplierBps, now(), c.get("user").id, targetId)),
-    ]);
-  }
   await audit(c.env, c.get("user").id, "user.update", "user", targetId, input);
   return c.json({ ok: true });
+});
+
+app.get("/api/owner/users/:id/entitlements", async (c) => {
+  await requireSiteMode(c, "plan");
+  const targetId = c.req.param("id");
+  const target = await c.env.DB.prepare("SELECT id, email FROM users WHERE id = ?").bind(targetId).first();
+  if (!target) return c.json({ error: "用户不存在" }, 404);
+  const timestamp = now();
+  const rows = await c.env.DB.prepare(
+    `SELECT e.id, e.plan_id, e.order_id, e.starts_at, e.ends_at, e.quota_bytes, e.status,
+      p.name AS plan_name
+     FROM entitlements e JOIN plans p ON p.id = e.plan_id
+     WHERE e.user_id = ? AND e.status = 'active' AND e.ends_at > ?
+     ORDER BY e.starts_at, e.ends_at`,
+  ).bind(targetId, timestamp).all<Record<string, unknown>>();
+  return c.json({ user: target, entitlements: rows.results.map((row) => ({
+    id: row.id, planId: row.plan_id, planName: row.plan_name, orderId: row.order_id,
+    startsAt: row.starts_at, endsAt: row.ends_at, quotaBytes: row.quota_bytes,
+    status: Number(row.starts_at) > timestamp ? "queued" : "current",
+  })) });
+});
+
+app.post("/api/owner/users/:userId/entitlements/:entitlementId/cancel", async (c) => {
+  assertMutation(c);
+  await requireSiteMode(c, "plan");
+  const timestamp = now();
+  const entitlement = await c.env.DB.prepare(
+    "SELECT * FROM entitlements WHERE id = ? AND user_id = ? AND status = 'active' AND ends_at > ?",
+  ).bind(c.req.param("entitlementId"), c.req.param("userId"), timestamp).first<EntitlementRecord>();
+  if (!entitlement) return c.json({ error: "未找到可取消的当前或待生效套餐" }, 404);
+  await closeEntitlement(c.env, entitlement, timestamp, "owner_cancel", c.get("user").id);
+  return c.json({ ok: true });
+});
+
+type DirectGrantInput = { nodeId: string; multiplier?: number; expiresAt?: number | null; quotaBytes?: number | null; quotaCycle?: "monthly" | "total" | null };
+
+app.get("/api/owner/users/:id/node-grants", async (c) => {
+  const targetId = c.req.param("id");
+  const target = await c.env.DB.prepare(
+    "SELECT u.id, u.email, u.status FROM users u JOIN user_roles ur ON ur.user_id = u.id WHERE u.id = ? AND ur.role = 'user'",
+  ).bind(targetId).first();
+  if (!target) return c.json({ error: "用户不存在" }, 404);
+  const grants = await directGrants(c.env, { userId: targetId });
+  return c.json({ user: target, grants: grants.map((grant) => ({
+    nodeId: grant.node_id, nodeName: grant.node_name, protocol: grant.protocol,
+    multiplier: grant.multiplier_bps / 10000, expiresAt: grant.expires_at,
+    quotaBytes: grant.quota_bytes, quotaCycle: grant.quota_cycle,
+    usedBytes: Number(grant.used_bytes), active: directGrantActive(grant), createdAt: grant.created_at,
+  })) });
+});
+
+app.put("/api/owner/users/:id/node-grants", async (c) => {
+  assertMutation(c);
+  await requireSiteMode(c, "direct");
+  const targetId = c.req.param("id");
+  const target = await c.env.DB.prepare(
+    "SELECT u.id FROM users u JOIN user_roles ur ON ur.user_id = u.id WHERE u.id = ? AND ur.role = 'user'",
+  ).bind(targetId).first();
+  if (!target) return c.json({ error: "用户不存在" }, 404);
+  const input = await body<{ grants: DirectGrantInput[] }>(c);
+  if (!Array.isArray(input.grants) || input.grants.length > 1000) return c.json({ error: "节点授权列表无效" }, 400);
+  const normalized = new Map<string, { multiplierBps: number; expiresAt: number | null; quotaBytes: number | null; quotaCycle: "monthly" | "total" | null }>();
+  for (const grant of input.grants) {
+    const multiplier = Number(grant.multiplier ?? 1);
+    const expiresAt = grant.expiresAt == null || grant.expiresAt === 0 ? null : Math.floor(Number(grant.expiresAt));
+    const quotaBytes = grant.quotaBytes == null || grant.quotaBytes === 0 ? null : Math.floor(Number(grant.quotaBytes));
+    const quotaCycle = quotaBytes == null ? null : grant.quotaCycle ?? null;
+    if (!grant.nodeId || !Number.isFinite(multiplier) || multiplier <= 0 || multiplier > 100) return c.json({ error: "节点倍率必须大于 0 且不超过 100" }, 400);
+    if (expiresAt != null && (!Number.isSafeInteger(expiresAt) || expiresAt <= 0)) return c.json({ error: "授权到期时间无效" }, 400);
+    if (quotaBytes != null && (!Number.isSafeInteger(quotaBytes) || quotaBytes <= 0)) return c.json({ error: "授权流量额度无效" }, 400);
+    if (quotaBytes != null && quotaCycle !== "monthly" && quotaCycle !== "total") return c.json({ error: "设置流量额度时必须选择额度周期" }, 400);
+    normalized.set(grant.nodeId, { multiplierBps: Math.round(multiplier * 10000), expiresAt, quotaBytes, quotaCycle });
+  }
+  const nodeIds = [...normalized.keys()];
+  if (nodeIds.length) {
+    const placeholders = nodeIds.map(() => "?").join(",");
+    const count = await c.env.DB.prepare(`SELECT COUNT(*) AS count FROM nodes WHERE status = 'approved' AND id IN (${placeholders})`).bind(...nodeIds).first<{ count: number }>();
+    if (Number(count?.count) !== nodeIds.length) return c.json({ error: "只能给用户分配已审核节点" }, 400);
+  }
+  const deleteStatement = nodeIds.length
+    ? c.env.DB.prepare(`DELETE FROM user_nodes WHERE user_id = ? AND node_id NOT IN (${nodeIds.map(() => "?").join(",")})`).bind(targetId, ...nodeIds)
+    : c.env.DB.prepare("DELETE FROM user_nodes WHERE user_id = ?").bind(targetId);
+  await c.env.DB.batch([
+    deleteStatement,
+    ...[...normalized].map(([nodeId, grant]) => c.env.DB.prepare(
+      `INSERT INTO user_nodes (user_id, node_id, multiplier_bps, created_at, created_by, expires_at, quota_bytes, quota_cycle, grant_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, node_id) DO UPDATE SET multiplier_bps = excluded.multiplier_bps,
+         expires_at = excluded.expires_at, quota_bytes = excluded.quota_bytes, quota_cycle = excluded.quota_cycle`,
+    ).bind(targetId, nodeId, grant.multiplierBps, now(), c.get("user").id, grant.expiresAt, grant.quotaBytes, grant.quotaCycle, newId("grant"))),
+  ]);
+  await audit(c.env, c.get("user").id, "user.node_grants.update", "user", targetId, { count: normalized.size });
+  return c.json({ ok: true, count: normalized.size });
 });
 
 app.post("/api/owner/invitations", async (c) => {
@@ -1089,6 +1290,7 @@ app.get("/api/owner/payment-methods", async (c) => {
 
 app.put("/api/owner/payment-methods/alipay", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const input = await body<{ displayName?: string; enabled?: boolean; gateway?: string; appId?: string; privateKey?: string; publicKey?: string }>(c);
   const displayName = String(input.displayName || "支付宝").trim();
   if (!displayName || displayName.length > 40) return c.json({ error: "支付方式名称不能为空且最多 40 字" }, 400);
@@ -1143,6 +1345,7 @@ app.get("/api/owner/withdrawals", async (c) => {
 
 app.post("/api/owner/withdrawals/:id/action", async (c) => {
   assertMutation(c);
+  await requireSiteMode(c, "plan");
   const owner = c.get("user");
   const input = await body<{ action: "paid" | "reject"; transferReference?: string }>(c);
   const withdrawal = await c.env.DB.prepare("SELECT * FROM withdrawals WHERE id = ? AND status = 'pending'").bind(c.req.param("id"))
@@ -1180,8 +1383,8 @@ app.get("/api/node/v1/config", async (c) => {
   const node = await nodeFromRequest(c.env, c.req.header("Authorization"));
   if (!node) return c.json({ error: "节点令牌无效" }, 401);
   const timestamp = now();
-  const authorizationMode = await nodeAuthorizationMode(c.env);
-  const users = node.status !== "approved" ? { results: [] as Record<string, unknown>[] } : authorizationMode === "plan"
+  const mode = await siteMode(c.env);
+  const planUsers = node.status === "approved" && mode === "plan"
     ? await c.env.DB.prepare(
       `SELECT DISTINCT u.id, u.access_uuid, u.access_secret, e.ends_at, e.quota_bytes,
         COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
@@ -1190,18 +1393,14 @@ app.get("/api/node/v1/config", async (c) => {
        LEFT JOIN quota_usage q ON q.user_id = u.id AND q.month_key = ?
        WHERE e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? AND u.status = 'active'
          AND COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) < e.quota_bytes`,
-    ).bind(node.id, monthKey(), timestamp, timestamp).all<Record<string, unknown>>()
-    : await c.env.DB.prepare(
-      `SELECT u.id, u.access_uuid, u.access_secret, NULL AS ends_at, NULL AS quota_bytes,
-        COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
-       FROM user_nodes un JOIN users u ON u.id = un.user_id
-       LEFT JOIN quota_usage q ON q.user_id = u.id AND q.month_key = ?
-       WHERE un.node_id = ? AND u.status = 'active'`,
-    ).bind(monthKey(), node.id).all<Record<string, unknown>>();
+    ).bind(node.id, monthKey(), timestamp, timestamp).all<Record<string, unknown>>() : { results: [] as Record<string, unknown>[] };
+  const directRows = node.status === "approved" && mode === "direct" ? await directGrants(c.env, { nodeId: node.id }) : [];
+  const directUsers = directRows.filter((grant) => directGrantActive(grant, timestamp));
   return c.json({
     node: { id: node.id, name: node.name, protocol: node.protocol, status: node.status, config: JSON.parse(node.config_json), updatedAt: node.updated_at },
-    authorizationMode,
-    users: users.results.map((user) => ({ id: user.id, uuid: user.access_uuid, secret: user.access_secret, expiresAt: user.ends_at, quotaBytes: user.quota_bytes, usedBytes: user.used_bytes, unlimited: authorizationMode === "user" })),
+    siteMode: mode,
+    users: mode === "plan" ? planUsers.results.map((user) => ({ id: user.id, uuid: user.access_uuid, secret: user.access_secret, expiresAt: user.ends_at, quotaBytes: user.quota_bytes, usedBytes: user.used_bytes, quotaCycle: "monthly", unlimited: false }))
+      : directUsers.map((grant) => ({ id: grant.user_id, uuid: grant.access_uuid, secret: grant.access_secret, expiresAt: grant.expires_at, quotaBytes: grant.quota_bytes, usedBytes: Number(grant.used_bytes), quotaCycle: grant.quota_cycle, unlimited: grant.expires_at == null && grant.quota_bytes == null })),
     generatedAt: timestamp,
   });
 });
@@ -1227,7 +1426,8 @@ app.post("/api/node/v1/usage", async (c) => {
   const duplicate = await c.env.DB.prepare("SELECT 1 FROM usage_reports WHERE node_id = ? AND report_id = ?").bind(node.id, input.reportId).first();
   if (duplicate) return c.json({ accepted: false, duplicate: true });
   const timestamp = now();
-  const authorizationMode = await nodeAuthorizationMode(c.env);
+  const mode = await siteMode(c.env);
+  const nodeGrants = mode === "direct" ? await directGrants(c.env, { nodeId: node.id }) : [];
   const statements: D1PreparedStatement[] = [
     c.env.DB.prepare("INSERT INTO usage_reports (report_id, node_id, reported_at) VALUES (?, ?, ?)").bind(input.reportId, node.id, timestamp),
   ];
@@ -1236,25 +1436,22 @@ app.post("/api/node/v1/usage", async (c) => {
     const up = Math.floor(Number(entry.upBytes));
     const down = Math.floor(Number(entry.downBytes));
     if (!entry.userId || !Number.isSafeInteger(up) || !Number.isSafeInteger(down) || up < 0 || down < 0 || up + down === 0) continue;
-    const access = authorizationMode === "plan"
+    const access = mode === "plan"
       ? await c.env.DB.prepare(
         `SELECT e.id AS entitlement_id, pn.multiplier_bps FROM entitlements e
          JOIN plan_nodes pn ON pn.plan_id = e.plan_id AND pn.node_id = ?
          WHERE e.user_id = ? AND e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? LIMIT 1`,
       ).bind(node.id, entry.userId, timestamp, timestamp).first<{ entitlement_id: string; multiplier_bps: number }>()
-      : await c.env.DB.prepare(
-        `SELECT NULL AS entitlement_id, un.multiplier_bps FROM user_nodes un JOIN users u ON u.id = un.user_id
-         WHERE un.user_id = ? AND un.node_id = ? AND u.status = 'active' LIMIT 1`,
-      ).bind(entry.userId, node.id).first<{ entitlement_id: null; multiplier_bps: number }>();
+      : (() => { const grant = nodeGrants.find((item) => item.user_id === entry.userId && directGrantActive(item, timestamp)); return grant ? { entitlement_id: null, multiplier_bps: grant.multiplier_bps, grant_key: grant.grant_key } : null; })();
     if (!access) continue;
     const chargedUp = Math.floor(up * Number(access.multiplier_bps || 10000) / 10000);
     const chargedDown = Math.floor(down * Number(access.multiplier_bps || 10000) / 10000);
-    statements.push(authorizationMode === "plan"
+    statements.push(mode === "plan"
       ? c.env.DB.prepare("INSERT INTO usage_entries (id, report_id, node_id, user_id, entitlement_id, up_bytes, down_bytes, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(newId("usage"), input.reportId, node.id, entry.userId, access.entitlement_id, up, down, timestamp)
-      : c.env.DB.prepare("INSERT INTO direct_usage_entries (id, report_id, node_id, user_id, up_bytes, down_bytes, charged_up_bytes, charged_down_bytes, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(newId("usage"), input.reportId, node.id, entry.userId, up, down, chargedUp, chargedDown, timestamp),
-      c.env.DB.prepare(
+      : c.env.DB.prepare("INSERT INTO direct_usage_entries (id, report_id, node_id, user_id, up_bytes, down_bytes, charged_up_bytes, charged_down_bytes, observed_at, grant_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(newId("usage"), input.reportId, node.id, entry.userId, up, down, chargedUp, chargedDown, timestamp, "grant_key" in access ? access.grant_key : null));
+    if (mode === "plan") statements.push(c.env.DB.prepare(
         `INSERT INTO quota_usage (user_id, month_key, up_bytes, down_bytes) VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, month_key) DO UPDATE SET up_bytes = up_bytes + excluded.up_bytes, down_bytes = down_bytes + excluded.down_bytes`,
       ).bind(entry.userId, monthKey(timestamp), chargedUp, chargedDown));
@@ -1275,25 +1472,24 @@ app.get("/sub/:token", async (c) => {
   const user = await loadUser(c.env, parsed.userId);
   if (!user || user.status !== "active" || user.subscriptionVersion !== parsed.version) return c.text("订阅链接已失效", 410);
   const timestamp = now();
-  const authorizationMode = await nodeAuthorizationMode(c.env);
-  const entitlement = authorizationMode === "plan" ? await c.env.DB.prepare(
+  const mode = await siteMode(c.env);
+  const entitlement = mode === "plan" ? await c.env.DB.prepare(
     "SELECT id, plan_id, quota_bytes FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? ORDER BY ends_at DESC LIMIT 1",
   ).bind(user.id, timestamp, timestamp).first<{ id: string; plan_id: string; quota_bytes: number }>() : null;
-  if (authorizationMode === "plan" && !entitlement) return c.text("当前没有有效套餐", 403);
+  if (mode === "plan" && !entitlement) return c.text("当前没有有效套餐", 403);
   const usage = await c.env.DB.prepare("SELECT up_bytes + down_bytes AS used FROM quota_usage WHERE user_id = ? AND month_key = ?")
     .bind(user.id, monthKey(timestamp)).first<{ used: number }>();
   if (entitlement && Number(usage?.used || 0) >= entitlement.quota_bytes) return c.text("本月流量已用尽", 403);
-  const accessSql = authorizationMode === "plan"
-    ? "SELECT node_id, multiplier_bps FROM plan_nodes WHERE plan_id = ?"
-    : "SELECT node_id, multiplier_bps FROM user_nodes WHERE user_id = ?";
-  const nodes = await c.env.DB.prepare(
-    `SELECT n.*, access.multiplier_bps FROM nodes n JOIN (${accessSql}) access ON access.node_id = n.id
-     JOIN users owner ON owner.id = n.owner_admin_id
-     LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
-     WHERE n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL
-     ORDER BY n.name`,
-  ).bind(authorizationMode === "plan" ? entitlement!.plan_id : user.id).all<NodeRow>();
-  if (authorizationMode === "user" && !nodes.results.length) return c.text("当前没有已分配节点", 403);
+  const activeDirectGrants = mode === "direct" ? (await directGrants(c.env, { userId: user.id })).filter((grant) => directGrantActive(grant, timestamp)) : [];
+  const nodes = mode === "plan" ? await c.env.DB.prepare(
+    `SELECT n.*, pn.multiplier_bps FROM nodes n JOIN plan_nodes pn ON pn.node_id = n.id
+     JOIN users owner ON owner.id = n.owner_admin_id LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
+     WHERE pn.plan_id = ? AND n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL ORDER BY n.name`,
+  ).bind(entitlement!.plan_id).all<NodeRow>() : activeDirectGrants.length ? await c.env.DB.prepare(
+    `SELECT n.*, un.multiplier_bps FROM nodes n JOIN user_nodes un ON un.node_id = n.id AND un.user_id = ?
+     WHERE n.id IN (${activeDirectGrants.map(() => "?").join(",")}) ORDER BY n.name`,
+  ).bind(user.id, ...activeDirectGrants.map((grant) => grant.node_id)).all<NodeRow>() : { results: [] as NodeRow[] };
+  if (mode === "direct" && !nodes.results.length) return c.text("当前没有有效的节点授权", 403);
   try {
     const result = renderSubscription(c.req.query("target") || "clash", nodes.results, { uuid: user.accessUuid, secret: user.accessSecret });
     const headers = new Headers({ "content-type": result.contentType, "cache-control": "no-store, private" });

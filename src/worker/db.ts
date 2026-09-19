@@ -37,6 +37,10 @@ export function monthKey(timestamp = now()): string {
   return `${year}-${month}`;
 }
 
+export function monthStart(timestamp = now()): number {
+  return Math.floor(Date.parse(`${monthKey(timestamp)}-01T00:00:00+08:00`) / 1000);
+}
+
 export async function audit(
   env: Env,
   actorId: string | null,

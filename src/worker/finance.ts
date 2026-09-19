@@ -33,7 +33,13 @@ export async function settleNodePool(env: Env, entitlement: EntitlementRow, clos
   if (statements.length) await env.DB.batch(statements);
 }
 
-export async function closeEntitlement(env: Env, entitlement: EntitlementRow, at: number, reason: "upgrade" | "expired") {
+export async function closeEntitlement(
+  env: Env,
+  entitlement: EntitlementRow,
+  at: number,
+  reason: "upgrade" | "expired" | "owner_cancel",
+  actorId: string | null = null,
+) {
   if (entitlement.status !== "active") return;
   await settleNodePool(env, entitlement, at, reason);
   if (reason === "upgrade") {
@@ -50,7 +56,7 @@ export async function closeEntitlement(env: Env, entitlement: EntitlementRow, at
   }
   await env.DB.prepare("UPDATE entitlements SET status = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status = 'active'")
     .bind(reason === "expired" ? "expired" : "closed", at, reason, entitlement.id).run();
-  await audit(env, null, `entitlement.${reason}`, "entitlement", entitlement.id);
+  await audit(env, actorId, `entitlement.${reason}`, "entitlement", entitlement.id);
 }
 
 export async function settleExpiredEntitlements(env: Env) {

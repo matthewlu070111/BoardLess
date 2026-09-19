@@ -6,6 +6,7 @@ import "./styles.css";
 
 type Role = "user" | "admin" | "owner";
 type User = { id: string; email: string; roles: Role[]; status: string; inviterAdminId: string | null };
+type SiteMode = "plan" | "direct";
 type Json = Record<string, any>;
 
 async function api<T = Json>(path: string, options: RequestInit = {}): Promise<T> {
@@ -19,19 +20,20 @@ async function api<T = Json>(path: string, options: RequestInit = {}): Promise<T
   return data as T;
 }
 
-const AuthContext = createContext<{ user: User | null; loading: boolean; refresh(): Promise<void>; logout(): Promise<void> } | null>(null);
+const AuthContext = createContext<{ user: User | null; siteMode: SiteMode; loading: boolean; refresh(): Promise<void>; logout(): Promise<void> } | null>(null);
 
 function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
+  const [siteMode, setSiteMode] = useState<SiteMode>("plan");
   const [loading, setLoading] = useState(true);
   const refresh = async () => {
-    try { setUser((await api<{ user: User }>("/api/me")).user); }
+    try { const result = await api<{ user: User; siteMode: SiteMode }>("/api/me"); setUser(result.user); setSiteMode(result.siteMode); }
     catch { setUser(null); }
     finally { setLoading(false); }
   };
   useEffect(() => { refresh(); }, []);
   const logout = async () => { await api("/api/auth/logout", { method: "POST", body: "{}" }); setUser(null); };
-  return <AuthContext.Provider value={{ user, loading, refresh, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={{ user, siteMode, loading, refresh, logout }}>{children}</AuthContext.Provider>;
 }
 
 function useAuth() {
@@ -99,20 +101,21 @@ function Invite() {
 }
 
 type NavItem = { to: string; label: string; icon: string };
-const userNav: NavItem[] = [
-  { to: "/app", label: "概览", icon: "⌂" }, { to: "/app/plans", label: "购买套餐", icon: "◇" },
-  { to: "/app/subscription", label: "订阅", icon: "↗" }, { to: "/app/usage", label: "流量", icon: "▥" }, { to: "/app/orders", label: "订单", icon: "▤" },
+const userNav = (siteMode: SiteMode): NavItem[] => [
+  { to: "/app", label: "概览", icon: "⌂" }, ...(siteMode === "plan" ? [{ to: "/app/plans", label: "购买套餐", icon: "◇" }] : []),
+  { to: "/app/subscription", label: "订阅", icon: "↗" }, { to: "/app/usage", label: "流量", icon: "▥" }, { to: "/app/orders", label: "历史订单", icon: "▤" },
 ];
-const adminNav: NavItem[] = [
+const adminNav = (siteMode: SiteMode): NavItem[] => [
   { to: "/admin", label: "概览", icon: "⌂" }, { to: "/admin/nodes", label: "我的节点", icon: "⌘" },
-  { to: "/admin/users", label: "邀请用户", icon: "♙" }, { to: "/admin/earnings", label: "收益与提现", icon: "¥" },
+  { to: "/admin/users", label: "邀请用户", icon: "♙" }, ...(siteMode === "plan" ? [{ to: "/admin/earnings", label: "收益与提现", icon: "¥" }] : []),
 ];
-const ownerNav: NavItem[] = [
+const ownerNav = (siteMode: SiteMode): NavItem[] => [
   { to: "/owner", label: "全站概览", icon: "⌂" }, { to: "/owner/nodes", label: "节点管理", icon: "⌘" },
   { to: "/owner/backends", label: "后端仓库", icon: "↯" },
-  { to: "/owner/plans", label: "套餐编排", icon: "◇" }, { to: "/owner/users", label: "账号管理", icon: "♙" },
-  { to: "/owner/payments", label: "支付对接", icon: "¤" }, { to: "/owner/orders", label: "订单", icon: "▤" },
-  { to: "/owner/withdrawals", label: "提现审核", icon: "¥" }, { to: "/owner/audit", label: "审计日志", icon: "◉" },
+  ...(siteMode === "plan" ? [{ to: "/owner/plans", label: "套餐编排", icon: "◇" }] : [{ to: "/owner/grants", label: "节点授权", icon: "◇" }]),
+  { to: "/owner/users", label: "账号管理", icon: "♙" },
+  ...(siteMode === "plan" ? [{ to: "/owner/payments", label: "支付对接", icon: "¤" }, { to: "/owner/orders", label: "订单", icon: "▤" }, { to: "/owner/withdrawals", label: "提现审核", icon: "¥" }] : []),
+  { to: "/owner/audit", label: "审计日志", icon: "◉" }, { to: "/owner/settings", label: "系统设置", icon: "⚙" },
 ];
 
 function Protected({ role, children }: { role?: "admin" | "owner"; children: ReactNode }) {
@@ -123,10 +126,16 @@ function Protected({ role, children }: { role?: "admin" | "owner"; children: Rea
   return <>{children}</>;
 }
 
+function ModeOnly({ siteMode: required, children }: { siteMode: SiteMode; children: ReactNode }) {
+  const { user, siteMode } = useAuth();
+  const fallback = user?.roles.includes("owner") ? "/owner" : user?.roles.includes("admin") ? "/admin" : "/app";
+  return siteMode === required ? <>{children}</> : <Navigate to={fallback} replace />;
+}
+
 function Shell({ mode, children }: { mode: "user" | "admin" | "owner"; children: ReactNode }) {
-  const { user, logout } = useAuth();
+  const { user, siteMode, logout } = useAuth();
   const location = useLocation(); const navigate = useNavigate(); const [open, setOpen] = useState(false);
-  const nav = mode === "user" ? userNav : mode === "admin" ? adminNav : ownerNav;
+  const nav = mode === "user" ? userNav(siteMode) : mode === "admin" ? adminNav(siteMode) : ownerNav(siteMode);
   const title = mode === "user" ? "用户中心" : mode === "admin" ? "节点管理" : "站长控制台";
   return <div className="app-shell">
     <aside className={`sidebar ${open ? "open" : ""}`}>
@@ -155,11 +164,19 @@ function Badge({ value }: { value: string }) { const labels: Record<string, stri
 const money = (cents: number) => `¥${(Number(cents || 0) / 100).toFixed(2)}`;
 const bytes = (value: number) => { const units = ["B", "KB", "MB", "GB", "TB"]; let size = Number(value || 0), unit = 0; while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; } return `${size.toFixed(unit > 2 ? 2 : 1)} ${units[unit]}`; };
 const date = (value: number) => value ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Shanghai" }).format(new Date(value * 1000)) : "—";
+const datetimeInput = (value: number | null | undefined) => value ? new Date(value * 1000 - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : "";
 
 function UserDashboard() {
   const [data, setData] = useState<Json | null>(null);
   useEffect(() => { api("/api/app/dashboard").then(setData); }, []);
   if (!data) return <Loading />;
+  if (data.siteMode === "direct") {
+    const active = data.grants.filter((grant: Json) => grant.active);
+    return <Page title="概览" description="逐节点授权状态与使用情况">
+      <div className="stat-grid four"><Stat label="有效节点" value={String(active.length)} hint={`共分配 ${data.grants.length} 个节点`} /><Stat label="不限期节点" value={String(active.filter((grant: Json) => !grant.expiresAt).length)} /><Stat label="不限量节点" value={String(active.filter((grant: Json) => !grant.quotaBytes).length)} /><Stat label="历史订单" value={String(data.orderCount)} hint="仅供历史查询" /></div>
+      <section className="panel"><div className="row-between"><div><p className="eyebrow">逐节点授权</p><h2>我的节点</h2></div><Link className="button primary" to="/app/subscription">获取订阅</Link></div><div className="grant-grid">{data.grants.map((grant: Json) => { const percent = grant.quotaBytes ? Math.min(100, grant.usedBytes / grant.quotaBytes * 100) : 0; return <article className="grant-card" key={grant.nodeId}><div className="row-between"><strong>{grant.name}</strong><Badge value={grant.active ? "active" : "expired"} /></div><p>{String(grant.protocol).toUpperCase()} · {grant.multiplier}x 倍率</p><p>{grant.expiresAt ? `${date(grant.expiresAt)} 到期` : "不限期"} · {grant.quotaBytes ? `${grant.quotaCycle === "monthly" ? "每月" : "授权期"} ${bytes(grant.quotaBytes)}` : "不限流量"}</p>{grant.quotaBytes && <><div className="progress"><span style={{ width: `${percent}%` }} /></div><small>{bytes(grant.usedBytes)} / {bytes(grant.quotaBytes)}</small></>}</article>; })}</div>{!data.grants.length && <Empty>站长尚未分配节点</Empty>}</section>
+    </Page>;
+  }
   const used = Number(data.usage.up_bytes || 0) + Number(data.usage.down_bytes || 0);
   const quota = Number(data.entitlement?.quota_bytes || 0);
   const percent = quota ? Math.min(100, used / quota * 100) : 0;
@@ -225,8 +242,10 @@ function Subscription() {
 }
 
 function Usage() {
-  const [rows, setRows] = useState<Json[] | null>(null); useEffect(() => { api<{ usage: Json[] }>("/api/app/usage").then((r) => setRows(r.usage)); }, []);
-  if (!rows) return <Loading />;
+  const [data, setData] = useState<Json | null>(null); useEffect(() => { api<Json>("/api/app/usage").then(setData); }, []);
+  if (!data) return <Loading />;
+  const rows = data.usage as Json[];
+  if (data.siteMode === "direct") return <Page title="流量明细" description="逐节点展示原始流量与倍率折算流量"><section className="panel table-wrap"><table><thead><tr><th>月份</th><th>节点</th><th>原始上行</th><th>原始下行</th><th>额度计费</th></tr></thead><tbody>{rows.map((row) => <tr key={`${row.month_key}:${row.node_id}`}><td>{row.month_key}</td><td>{row.node_name}</td><td>{bytes(row.up_bytes)}</td><td>{bytes(row.down_bytes)}</td><td><strong>{bytes(row.charged_up_bytes + row.charged_down_bytes)}</strong></td></tr>)}</tbody></table>{!rows.length && <Empty>暂无流量记录</Empty>}</section></Page>;
   return <Page title="流量明细" description="按自然月统计节点上报的上下行流量"><section className="panel table-wrap"><table><thead><tr><th>月份</th><th>上行</th><th>下行</th><th>合计</th></tr></thead><tbody>{rows.map((row) => <tr key={row.month_key}><td>{row.month_key}</td><td>{bytes(row.up_bytes)}</td><td>{bytes(row.down_bytes)}</td><td><strong>{bytes(row.up_bytes + row.down_bytes)}</strong></td></tr>)}</tbody></table>{!rows.length && <Empty>暂无流量记录</Empty>}</section></Page>;
 }
 
@@ -237,9 +256,10 @@ function Orders() {
 }
 
 function AdminDashboard() {
+  const { siteMode } = useAuth();
   const [data, setData] = useState<Json | null>(null); useEffect(() => { api("/api/admin/overview").then(setData); }, []);
   if (!data) return <Loading />;
-  return <Page title="管理员概览" description="你的节点、用户与可提现收益"><div className="stat-grid four"><Stat label="节点" value={String(data.nodeCount)} hint="仅你可以维护配置" /><Stat label="邀请用户" value={String(data.invitedUsers)} hint="归属关系固定" /><Stat label="可提现" value={money(data.availableCents)} hint="最低 ¥100" /><Stat label="待处理提现" value={String(data.pendingWithdrawals)} hint="由站长人工核销" /></div><section className="panel"><h2>节点接入流程</h2><div className="steps"><span><b>1</b> 选择站长启用的节点后端</span><span><b>2</b> 按后端提供的表单完成配置</span><span><b>3</b> 在服务器执行一次性安装命令</span><span><b>4</b> 等待站长审核并加入套餐</span></div></section></Page>;
+  return <Page title="管理员概览" description={siteMode === "plan" ? "你的节点、用户与可提现收益" : "逐节点授权站点中的节点和用户"}><div className={`stat-grid ${siteMode === "plan" ? "four" : ""}`}><Stat label="节点" value={String(data.nodeCount)} hint="仅你可以维护配置" /><Stat label="邀请用户" value={String(data.invitedUsers)} hint="归属关系固定" />{siteMode === "plan" && <><Stat label="可提现" value={money(data.availableCents)} hint="最低 ¥100" /><Stat label="待处理提现" value={String(data.pendingWithdrawals)} hint="由站长人工核销" /></>}</div><section className="panel"><h2>节点接入流程</h2><div className="steps"><span><b>1</b> 选择站长启用的节点后端</span><span><b>2</b> 按后端提供的表单完成配置</span><span><b>3</b> 在服务器执行一次性安装命令</span><span><b>4</b> 等待站长审核{siteMode === "plan" ? "并加入套餐" : "并由站长分配给用户"}</span></div></section></Page>;
 }
 
 function AdminNodes() {
@@ -305,6 +325,7 @@ function NodeDeploy({ returnTo }: { returnTo: string }) {
 }
 
 function AdminUsers() {
+  const { siteMode } = useAuth();
   const [users, setUsers] = useState<Json[] | null>(null); const [link, setLink] = useState("");
   const load = () => api<{ users: Json[] }>("/api/admin/users").then((r) => setUsers(r.users)); useEffect(() => { void load(); }, []);
   const invite = async () => { const result = await api<Json>("/api/admin/invitations", { method: "POST", body: JSON.stringify({ expiresHours: 72 }) }); setLink(result.url); await navigator.clipboard.writeText(result.url); };
@@ -312,7 +333,7 @@ function AdminUsers() {
   if (!users) return <Loading />;
   return <Page title="邀请用户" description="用户归属关系创建后不可修改" action={<button className="button primary" onClick={invite}>生成邀请链接</button>}>
     {link && <Notice tone="success">邀请链接已复制，有效期 72 小时：<code className="token">{link}</code></Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>邮箱</th><th>状态</th><th>套餐到期</th><th>加入时间</th><th></th></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.email}</td><td><Badge value={user.status} /></td><td>{date(user.expires_at)}</td><td>{date(user.created_at)}</td><td><button className="link-button" onClick={() => toggle(user)}>{user.status === "active" ? "停用" : "恢复"}</button></td></tr>)}</tbody></table>{!users.length && <Empty>还没有受邀用户</Empty>}</section>
+    <section className="panel table-wrap"><table><thead><tr><th>邮箱</th><th>状态</th>{siteMode === "plan" && <th>套餐到期</th>}<th>加入时间</th><th></th></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.email}</td><td><Badge value={user.status} /></td>{siteMode === "plan" && <td>{date(user.expires_at)}</td>}<td>{date(user.created_at)}</td><td><button className="link-button" onClick={() => toggle(user)}>{user.status === "active" ? "停用" : "恢复"}</button></td></tr>)}</tbody></table>{!users.length && <Empty>还没有受邀用户</Empty>}</section>
   </Page>;
 }
 
@@ -325,9 +346,10 @@ function AdminEarnings() {
 }
 
 function OwnerDashboard() {
+  const { siteMode } = useAuth();
   const [data, setData] = useState<Json | null>(null); useEffect(() => { api<Json>("/api/owner/overview").then((r) => setData(r.overview)); }, []);
   if (!data) return <Loading />;
-  return <Page title="全站概览" description="平台用户、节点与交易状态"><div className="stat-grid four"><Stat label="用户" value={String(data.users)} hint={`${data.admins} 位管理员`} /><Stat label="已审核节点" value={String(data.active_nodes)} hint={`${data.pending_nodes} 个待审核`} /><Stat label="累计实收" value={money(data.revenue_cents)} hint="仅支付宝现金部分" /><Stat label="待审提现" value={String(data.pending_withdrawals)} hint="人工转账后核销" /></div><section className="panel feature-panel"><div><p className="eyebrow">节点治理</p><h2>自营节点与管理员节点分权维护</h2><p className="muted">站长可直接新增并维护自营节点；管理员节点仍由原管理员维护，站长负责审核、停用和套餐编排。</p></div><div className="quick-actions"><Link className="button primary" to="/owner/nodes">管理节点</Link><Link className="button" to="/owner/withdrawals">处理提现</Link></div></section></Page>;
+  return <Page title="全站概览" description={siteMode === "plan" ? "套餐运营、节点与交易状态" : "逐节点授权、用户与节点状态"}><div className={`stat-grid ${siteMode === "plan" ? "four" : ""}`}><Stat label="用户" value={String(data.users)} hint={`${data.admins} 位管理员`} /><Stat label="已审核节点" value={String(data.active_nodes)} hint={`${data.pending_nodes} 个待审核`} />{siteMode === "plan" && <><Stat label="累计实收" value={money(data.revenue_cents)} hint="仅支付宝现金部分" /><Stat label="待审提现" value={String(data.pending_withdrawals)} hint="人工转账后核销" /></>}</div><section className="panel feature-panel"><div><p className="eyebrow">{siteMode === "plan" ? "套餐运营模式" : "逐节点授权模式"}</p><h2>{siteMode === "plan" ? "套餐决定用户可用节点" : "站长直接为用户逐个分配节点"}</h2><p className="muted">站长可直接新增并维护自营节点；管理员节点仍由原管理员维护，站长负责审核与授权。</p></div><div className="quick-actions"><Link className="button primary" to="/owner/nodes">管理节点</Link><Link className="button" to={siteMode === "plan" ? "/owner/plans" : "/owner/grants"}>{siteMode === "plan" ? "编排套餐" : "分配节点"}</Link></div></section></Page>;
 }
 
 function OwnerNodes() {
@@ -346,35 +368,66 @@ function OwnerNodes() {
 }
 
 function OwnerPlans() {
-  const [plans, setPlans] = useState<Json[] | null>(null); const [nodes, setNodes] = useState<Json[]>([]); const [mode, setMode] = useState<"plan" | "user">("plan"); const [show, setShow] = useState(false); const [error, setError] = useState("");
+  const [plans, setPlans] = useState<Json[] | null>(null); const [nodes, setNodes] = useState<Json[]>([]); const [show, setShow] = useState(false); const [error, setError] = useState("");
   const emptyPlan = { id: "", name: "", description: "", price: "", durationDays: 30, quotaGb: 100, nodePoolPercent: 0, status: "active", nodeMultipliers: {} as Record<string, number> };
   const [form, setForm] = useState<Json>(emptyPlan);
-  const load = async () => { const [p, n, setting] = await Promise.all([api<Json>("/api/owner/plans"), api<Json>("/api/owner/nodes"), api<Json>("/api/owner/settings/node-authorization")]); setPlans(p.plans); setNodes(n.nodes.filter((node: Json) => node.status === "approved")); setMode(setting.mode); }; useEffect(() => { load(); }, []);
-  const switchMode = async (next: "plan" | "user") => { if (next === mode || !confirm(`切换为“${next === "plan" ? "按套餐授权" : "按用户直接授权"}”后，订阅和节点后端将立即按此模式发放节点，继续吗？`)) return; await api("/api/owner/settings/node-authorization", { method: "PUT", body: JSON.stringify({ mode: next }) }); setMode(next); };
+  const load = async () => { const [p, n] = await Promise.all([api<Json>("/api/owner/plans"), api<Json>("/api/owner/nodes")]); setPlans(p.plans); setNodes(n.nodes.filter((node: Json) => node.status === "approved")); }; useEffect(() => { load(); }, []);
   const openPlan = (plan?: Json) => { setError(""); setForm(plan ? { id: plan.id, name: plan.name, description: plan.description, price: plan.price_cents / 100, durationDays: plan.duration_days, quotaGb: plan.quota_bytes / 1024 ** 3, nodePoolPercent: plan.node_pool_bps / 100, status: plan.status, nodeMultipliers: Object.fromEntries(plan.nodes.map((item: Json) => [item.nodeId, item.multiplier])) } : { ...emptyPlan, nodeMultipliers: {} }); setShow(true); };
   const save = async (event: FormEvent) => { event.preventDefault(); setError(""); try { const payload = { name: form.name, description: form.description, priceCents: Math.round(Number(form.price) * 100), durationDays: Number(form.durationDays), quotaBytes: Math.round(Number(form.quotaGb) * 1024 ** 3), nodePoolBps: Math.round(Number(form.nodePoolPercent) * 100), status: form.status, nodes: Object.entries(form.nodeMultipliers).map(([nodeId, multiplier]) => ({ nodeId, multiplier: Number(multiplier) })) }; await api(form.id ? `/api/owner/plans/${form.id}` : "/api/owner/plans", { method: form.id ? "PATCH" : "POST", body: JSON.stringify(payload) }); setShow(false); await load(); } catch (e) { setError(e instanceof Error ? e.message : "保存失败"); } };
+  const remove = async (plan: Json) => { if (!confirm(`确认永久删除套餐“${plan.name}”？已有订单或权益历史的套餐不能删除，可改为归档。`)) return; setError(""); try { await api(`/api/owner/plans/${plan.id}`, { method: "DELETE", body: "{}" }); await load(); } catch (reason) { setError(reason instanceof Error ? reason.message : "删除失败"); } };
   if (!plans) return <Loading />;
-  return <Page title="套餐编排" description="全站只能启用一种节点授权方式" action={mode === "plan" ? <button className="button primary" onClick={() => openPlan()}>＋ 新建套餐</button> : <Link className="button primary" to="/owner/users">前往分配用户节点</Link>}>
-    <section className="panel authorization-mode"><div><p className="eyebrow">节点授权模式</p><h2>{mode === "plan" ? "按套餐授权" : "按用户直接授权"}</h2><p className="muted">{mode === "plan" ? "用户获得当前有效套餐中配置的节点，用户直配关系不会生效。" : "站长逐个给用户分配节点，无需购买或持有套餐；套餐节点关系不会生效。"}</p></div><div className="mode-switch"><button className={`button ${mode === "plan" ? "primary" : ""}`} onClick={() => switchMode("plan")}>按套餐授权</button><button className={`button ${mode === "user" ? "primary" : ""}`} onClick={() => switchMode("user")}>按用户授权</button></div></section>
-    <div className="card-grid plans compact">{plans.map((plan) => <article className="plan-card" key={plan.id}><div className="row-between"><Badge value={plan.status} /><span>{plan.nodeIds.length} 节点</span></div><h2>{plan.name}</h2><div className="price"><span>¥</span>{(plan.price_cents / 100).toFixed(2)}<small> / {plan.duration_days} 天</small></div><ul><li>{bytes(plan.quota_bytes)} / 自然月</li><li>节点收益池 {(plan.node_pool_bps / 100).toFixed(2)}%</li>{plan.nodes.map((item: Json) => <li key={item.nodeId}>{nodes.find((node) => node.id === item.nodeId)?.name || item.nodeId} · {item.multiplier}x</li>)}</ul><button className="button" onClick={() => openPlan(plan)}>编辑配置</button></article>)}</div>
+  return <Page title="套餐编排" description="配置套餐包含的节点及各节点流量倍率" action={<button className="button primary" onClick={() => openPlan()}>＋ 新建套餐</button>}>
+    {error && !show && <Notice tone="danger">{error}</Notice>}
+    <div className="card-grid plans compact">{plans.map((plan) => <article className="plan-card" key={plan.id}><div className="row-between"><Badge value={plan.status} /><span>{plan.nodeIds.length} 节点</span></div><h2>{plan.name}</h2><div className="price"><span>¥</span>{(plan.price_cents / 100).toFixed(2)}<small> / {plan.duration_days} 天</small></div><ul><li>{bytes(plan.quota_bytes)} / 自然月</li><li>节点收益池 {(plan.node_pool_bps / 100).toFixed(2)}%</li>{plan.nodes.map((item: Json) => <li key={item.nodeId}>{nodes.find((node) => node.id === item.nodeId)?.name || item.nodeId} · {item.multiplier}x</li>)}</ul><div className="quick-actions"><button className="button" onClick={() => openPlan(plan)}>编辑配置</button><button className="button" onClick={() => remove(plan)}>删除套餐</button></div></article>)}</div>
     {!plans.length && <Empty>暂无套餐</Empty>}
     {show && <div className="modal-layer"><form className="modal" onSubmit={save}><button type="button" className="modal-close" onClick={() => setShow(false)}>×</button><p className="eyebrow">套餐配置</p><h2>{form.id ? "编辑套餐" : "新建套餐"}</h2><div className="form-grid"><Field label="套餐名称"><input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field><Field label="价格（元）"><input type="number" min="0" step="0.01" required value={form.price} onChange={(e) => setForm({ ...form, price: e.target.value })} /></Field><Field label="有效期（天）"><input type="number" min="1" required value={form.durationDays} onChange={(e) => setForm({ ...form, durationDays: e.target.value })} /></Field><Field label="每月流量（GB）"><input type="number" min="1" required value={form.quotaGb} onChange={(e) => setForm({ ...form, quotaGb: e.target.value })} /></Field><Field label="节点收益池（%）"><input type="number" min="0" max="100" step="0.01" value={form.nodePoolPercent} onChange={(e) => setForm({ ...form, nodePoolPercent: e.target.value })} /></Field><Field label="说明"><input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></Field>{form.id && <Field label="状态"><select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}><option value="active">启用</option><option value="archived">归档</option></select></Field>}</div><fieldset className="node-picker"><legend>选择节点及流量倍率</legend>{nodes.map((node) => { const selected = form.nodeMultipliers[node.id] !== undefined; return <label key={node.id}><input type="checkbox" checked={selected} onChange={(e) => { const next = { ...form.nodeMultipliers }; if (e.target.checked) next[node.id] = 1; else delete next[node.id]; setForm({ ...form, nodeMultipliers: next }); }} /> <span>{node.name}<small className="cell-sub">{node.protocol} · {node.owner_email}</small></span>{selected ? <input className="multiplier-input" aria-label={`${node.name} 倍率`} type="number" min="0.01" max="100" step="0.01" value={form.nodeMultipliers[node.id]} onChange={(e) => setForm({ ...form, nodeMultipliers: { ...form.nodeMultipliers, [node.id]: e.target.value } })} /> : <small>未加入</small>}</label>; })}</fieldset>{error && <Notice tone="danger">{error}</Notice>}<div className="modal-actions"><button type="button" className="button" onClick={() => setShow(false)}>取消</button><button className="button primary">保存套餐</button></div></form></div>}
   </Page>;
 }
 
 function OwnerUsers() {
-  const [users, setUsers] = useState<Json[] | null>(null); const [nodes, setNodes] = useState<Json[]>([]); const [link, setLink] = useState(""); const [editUser, setEditUser] = useState<Json | null>(null); const [error, setError] = useState("");
-  const load = async () => { const [u, n] = await Promise.all([api<{ users: Json[] }>("/api/owner/users"), api<{ nodes: Json[] }>("/api/owner/nodes")]); setUsers(u.users); setNodes(n.nodes.filter((node) => node.status === "approved")); }; useEffect(() => { void load(); }, []);
+  const { siteMode } = useAuth();
+  const [users, setUsers] = useState<Json[] | null>(null); const [link, setLink] = useState(""); const [planUser, setPlanUser] = useState<Json | null>(null); const [entitlements, setEntitlements] = useState<Json[] | null>(null); const [error, setError] = useState("");
+  const load = async () => { const result = await api<{ users: Json[] }>("/api/owner/users"); setUsers(result.users); }; useEffect(() => { void load(); }, []);
   const invite = async () => { const result = await api<Json>("/api/owner/invitations", { method: "POST", body: JSON.stringify({ expiresHours: 72 }) }); setLink(result.url); await navigator.clipboard.writeText(result.url); };
   const commission = async (user: Json) => { const value = prompt("输入销售佣金百分比（0-100）", String((user.commission_bps || 0) / 100)); if (value === null) return; await api(`/api/owner/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ commissionBps: Math.round(Number(value) * 100) }) }); await load(); };
   const balance = async (user: Json) => { const value = prompt("设置用户钱包余额（元）", String(Number(user.wallet_cents || 0) / 100)); if (value === null) return; const cents = Math.round(Number(value) * 100); if (!Number.isFinite(cents) || cents < 0) return alert("请输入有效的非负金额"); await api(`/api/owner/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ walletCents: cents }) }); await load(); };
-  const saveNodes = async () => { if (!editUser) return; setError(""); try { await api(`/api/owner/users/${editUser.id}`, { method: "PATCH", body: JSON.stringify({ nodes: editUser.nodes }) }); setEditUser(null); await load(); } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); } };
   const toggle = async (user: Json) => { await api(`/api/owner/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ status: user.status === "active" ? "disabled" : "active" }) }); await load(); };
+  const managePlans = async (user: Json) => { setPlanUser(user); setEntitlements(null); setError(""); try { const result = await api<Json>(`/api/owner/users/${user.id}/entitlements`); setEntitlements(result.entitlements); } catch (reason) { setError(reason instanceof Error ? reason.message : "读取套餐失败"); setEntitlements([]); } };
+  const cancelPlan = async (entitlement: Json) => { if (!planUser || !confirm(`确认立即取消“${planUser.email}”的“${entitlement.planName}”？此操作不会自动退款。`)) return; setError(""); try { await api(`/api/owner/users/${planUser.id}/entitlements/${entitlement.id}/cancel`, { method: "POST", body: "{}" }); const result = await api<Json>(`/api/owner/users/${planUser.id}/entitlements`); setEntitlements(result.entitlements); } catch (reason) { setError(reason instanceof Error ? reason.message : "取消套餐失败"); } };
   if (!users) return <Loading />;
-  return <Page title="账号管理" description="可调整钱包余额，并通过套餐或直接分配两种方式赋予用户节点" action={<button className="button primary" onClick={invite}>邀请管理员</button>}>
+  return <Page title="账号管理" description="管理账号状态与基础财务信息；节点权限在专用页面配置" action={<button className="button primary" onClick={invite}>邀请管理员</button>}>
     {link && <Notice tone="success">管理员邀请链接已复制：<code className="token">{link}</code></Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>邮箱</th><th>角色</th><th>归属管理员</th><th>余额</th><th>直配节点</th><th>状态</th><th>加入时间</th><th></th></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.email}</td><td>{user.roles.join(" / ")}</td><td>{user.inviter_email || "—"}</td><td>{money(user.wallet_cents)}</td><td>{user.nodes.length}</td><td><Badge value={user.status} /></td><td>{date(user.created_at)}</td><td className="actions">{user.roles.includes("admin") && <button className="link-button" onClick={() => commission(user)}>佣金比例</button>}<button className="link-button" onClick={() => balance(user)}>修改余额</button>{user.roles.includes("user") && <button className="link-button" onClick={() => setEditUser({ ...user, nodes: user.nodes.map((item: Json) => ({ ...item })) })}>分配节点</button>}<button className="link-button" onClick={() => toggle(user)}>{user.status === "active" ? "停用" : "恢复"}</button></td></tr>)}</tbody></table></section>
-    {editUser && <div className="modal-layer"><section className="modal"><button className="modal-close" onClick={() => setEditUser(null)}>×</button><p className="eyebrow">直接分配节点</p><h2>{editUser.email}</h2><Notice>这些节点仅在“按用户直接授权”模式下生效，无需给用户购买或配置套餐。</Notice><fieldset className="node-picker"><legend>节点及流量倍率</legend>{nodes.map((node) => { const assigned = editUser.nodes.find((item: Json) => item.nodeId === node.id); return <label key={node.id}><input type="checkbox" checked={Boolean(assigned)} onChange={(e) => setEditUser({ ...editUser, nodes: e.target.checked ? [...editUser.nodes, { nodeId: node.id, multiplier: 1 }] : editUser.nodes.filter((item: Json) => item.nodeId !== node.id) })} /><span>{node.name}<small className="cell-sub">{node.protocol} · {node.owner_email}</small></span>{assigned ? <input className="multiplier-input" type="number" min="0.01" max="100" step="0.01" value={assigned.multiplier} onChange={(e) => setEditUser({ ...editUser, nodes: editUser.nodes.map((item: Json) => item.nodeId === node.id ? { ...item, multiplier: e.target.value } : item) })} /> : <small>未分配</small>}</label>; })}</fieldset>{error && <Notice tone="danger">{error}</Notice>}<div className="modal-actions"><button className="button" onClick={() => setEditUser(null)}>取消</button><button className="button primary" onClick={saveNodes}>保存分配</button></div></section></div>}
+    <section className="panel table-wrap"><table><thead><tr><th>邮箱</th><th>角色</th><th>归属管理员</th><th>余额</th><th>状态</th><th>加入时间</th><th></th></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.email}</td><td>{user.roles.join(" / ")}</td><td>{user.inviter_email || "—"}</td><td>{money(user.wallet_cents)}</td><td><Badge value={user.status} /></td><td>{date(user.created_at)}</td><td className="actions">{siteMode === "plan" && user.roles.includes("admin") && <button className="link-button" onClick={() => commission(user)}>佣金比例</button>}{siteMode === "plan" && user.roles.includes("user") && <button className="link-button" onClick={() => managePlans(user)}>套餐管理</button>}<button className="link-button" onClick={() => balance(user)}>修改余额</button><button className="link-button" onClick={() => toggle(user)}>{user.status === "active" ? "停用" : "恢复"}</button></td></tr>)}</tbody></table></section>
+    {planUser && <div className="modal-layer"><section className="modal"><button type="button" className="modal-close" onClick={() => setPlanUser(null)}>×</button><p className="eyebrow">账号套餐</p><h2>{planUser.email}</h2><p className="muted">取消后权益立即失效，待生效套餐也会被撤销；系统不会自动退款。</p>{error && <Notice tone="danger">{error}</Notice>}{entitlements === null ? <Loading /> : entitlements.length ? <div className="form-stack">{entitlements.map((entitlement) => <section className="panel" key={entitlement.id}><div className="row-between"><div><strong>{entitlement.planName}</strong><small className="cell-sub">{entitlement.status === "queued" ? "待生效" : "当前生效"} · {date(entitlement.startsAt)} 至 {date(entitlement.endsAt)}</small><small className="cell-sub">额度 {bytes(entitlement.quotaBytes)} · 订单 {entitlement.orderId}</small></div><button className="button" onClick={() => cancelPlan(entitlement)}>取消套餐</button></div></section>)}</div> : <Empty>该账号没有当前或待生效套餐</Empty>}<div className="modal-actions"><button className="button" onClick={() => setPlanUser(null)}>关闭</button></div></section></div>}
+  </Page>;
+}
+
+function OwnerGrants() {
+  const [users, setUsers] = useState<Json[] | null>(null); const [nodes, setNodes] = useState<Json[]>([]); const [userId, setUserId] = useState(""); const [grants, setGrants] = useState<Record<string, Json>>({}); const [busy, setBusy] = useState(false); const [notice, setNotice] = useState(""); const [error, setError] = useState("");
+  useEffect(() => { Promise.all([api<Json>("/api/owner/users"), api<Json>("/api/owner/nodes")]).then(([u, n]) => { const eligible = u.users.filter((user: Json) => user.roles.includes("user")); setUsers(eligible); setNodes(n.nodes.filter((node: Json) => node.status === "approved")); if (eligible[0]) setUserId(eligible[0].id); }); }, []);
+  useEffect(() => { if (!userId) { setGrants({}); return; } api<Json>(`/api/owner/users/${userId}/node-grants`).then((result) => setGrants(Object.fromEntries(result.grants.map((grant: Json) => [grant.nodeId, { ...grant, expiresAtInput: datetimeInput(grant.expiresAt), quotaGb: grant.quotaBytes ? grant.quotaBytes / 1024 ** 3 : "" }])))).catch((reason) => setError(reason.message)); }, [userId]);
+  const toggleNode = (nodeId: string, checked: boolean) => { const next = { ...grants }; if (checked) next[nodeId] = { nodeId, multiplier: 1, expiresAtInput: "", quotaGb: "", quotaCycle: "monthly", usedBytes: 0, active: true }; else delete next[nodeId]; setGrants(next); };
+  const updateGrant = (nodeId: string, patch: Json) => setGrants({ ...grants, [nodeId]: { ...grants[nodeId], ...patch } });
+  const save = async () => { setBusy(true); setError(""); setNotice(""); try { await api(`/api/owner/users/${userId}/node-grants`, { method: "PUT", body: JSON.stringify({ grants: Object.values(grants).map((grant: Json) => ({ nodeId: grant.nodeId, multiplier: Number(grant.multiplier), expiresAt: grant.expiresAtInput ? Math.floor(new Date(grant.expiresAtInput).getTime() / 1000) : null, quotaBytes: grant.quotaGb === "" ? null : Math.round(Number(grant.quotaGb) * 1024 ** 3), quotaCycle: grant.quotaGb === "" ? null : grant.quotaCycle })) }) }); setNotice("节点授权已保存"); const result = await api<Json>(`/api/owner/users/${userId}/node-grants`); setGrants(Object.fromEntries(result.grants.map((grant: Json) => [grant.nodeId, { ...grant, expiresAtInput: datetimeInput(grant.expiresAt), quotaGb: grant.quotaBytes ? grant.quotaBytes / 1024 ** 3 : "" }]))); } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); } finally { setBusy(false); } };
+  if (!users) return <Loading />;
+  return <Page title="节点授权" description="逐个用户、逐个节点配置独立期限、额度周期和流量倍率" action={<button className="button primary" disabled={!userId || busy} onClick={save}>{busy ? "保存中…" : "保存授权"}</button>}>
+    {notice && <Notice tone="success">{notice}</Notice>}{error && <Notice tone="danger">{error}</Notice>}
+    <section className="panel"><Field label="选择用户"><select value={userId} onChange={(event) => { setNotice(""); setError(""); setUserId(event.target.value); }}><option value="" disabled>请选择用户</option>{users.map((user) => <option key={user.id} value={user.id}>{user.email} · {user.status === "active" ? "正常" : "已停用"}</option>)}</select></Field></section>
+    <div className="grant-editor">{nodes.map((node) => { const grant = grants[node.id]; return <article className={`panel grant-editor-card ${grant ? "selected" : ""}`} key={node.id}><label className="grant-heading"><input type="checkbox" checked={Boolean(grant)} onChange={(event) => toggleNode(node.id, event.target.checked)} /><span><strong>{node.name}</strong><small>{String(node.protocol).toUpperCase()} · {node.owner_email}</small></span>{grant && <Badge value={grant.active === false ? "expired" : "active"} />}</label>{grant && <div className="form-grid grant-fields"><Field label="流量倍率"><input type="number" min="0.01" max="100" step="0.01" value={grant.multiplier} onChange={(event) => updateGrant(node.id, { multiplier: event.target.value })} /></Field><Field label="到期时间" hint="留空表示不限期"><input type="datetime-local" value={grant.expiresAtInput} onChange={(event) => updateGrant(node.id, { expiresAtInput: event.target.value })} /></Field><Field label="流量额度（GB）" hint="留空表示不限量"><input type="number" min="0.01" step="0.01" value={grant.quotaGb} onChange={(event) => updateGrant(node.id, { quotaGb: event.target.value })} /></Field><Field label="额度周期"><select disabled={grant.quotaGb === ""} value={grant.quotaCycle || "monthly"} onChange={(event) => updateGrant(node.id, { quotaCycle: event.target.value })}><option value="monthly">每自然月重置</option><option value="total">整个授权期累计</option></select></Field></div>}{grant?.quotaBytes && <p className="muted">当前周期已计费 {bytes(grant.usedBytes)} / {bytes(grant.quotaBytes)}</p>}</article>; })}</div>
+    {!users.length && <section className="panel"><Empty>暂无普通用户</Empty></section>}{!nodes.length && <section className="panel"><Empty>暂无已审核节点</Empty></section>}
+  </Page>;
+}
+
+function OwnerSettings() {
+  const { refresh } = useAuth(); const navigate = useNavigate();
+  const [data, setData] = useState<Json | null>(null); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
+  const load = () => api<Json>("/api/owner/settings/site-mode").then(setData); useEffect(() => { void load(); }, []);
+  const switchMode = async (next: SiteMode) => { if (!data || next === data.mode || !confirm(`确认切换为“${next === "plan" ? "套餐运营模式" : "逐节点授权模式"}”？切换不会转换或删除历史数据。`)) return; setBusy(true); setError(""); try { await api("/api/owner/settings/site-mode", { method: "PUT", body: JSON.stringify({ mode: next }) }); await refresh(); navigate(next === "plan" ? "/owner/plans" : "/owner/grants"); } catch (reason) { setError(reason instanceof Error ? reason.message : "切换失败"); await load(); } finally { setBusy(false); } };
+  if (!data) return <Loading />;
+  const blockerTotal = Object.values(data.blockers || {}).reduce((sum: number, value: any) => sum + Number(value), 0);
+  return <Page title="系统设置" description="站点模式决定整站的用户界面、商业功能和节点授权链路">
+    {error && <Notice tone="danger">{error}</Notice>}{blockerTotal > 0 && <Notice tone="danger">当前仍有未结业务，暂时不能切换：{data.blockers.entitlements ? `有效或未来套餐 ${data.blockers.entitlements} 个；` : ""}{data.blockers.orders ? `待处理订单 ${data.blockers.orders} 个；` : ""}{data.blockers.withdrawals ? `待处理提现 ${data.blockers.withdrawals} 个；` : ""}{data.blockers.grants ? `有效节点授权 ${data.blockers.grants} 个；` : ""}</Notice>}
+    <div className="mode-cards"><article className={`panel mode-card ${data.mode === "plan" ? "selected" : ""}`}><p className="eyebrow">套餐运营</p><h2>套餐运营模式</h2><p className="muted">用户购买套餐；套餐决定期限、流量和可用节点。启用支付、订单、佣金与提现。</p><button className={`button ${data.mode === "plan" ? "primary" : ""}`} disabled={busy || data.mode === "plan" || blockerTotal > 0} onClick={() => switchMode("plan")}>{data.mode === "plan" ? "当前模式" : "切换到套餐模式"}</button></article><article className={`panel mode-card ${data.mode === "direct" ? "selected" : ""}`}><p className="eyebrow">逐节点授权</p><h2>逐节点授权模式</h2><p className="muted">站长为用户逐个分配节点，每个授权独立设置期限、额度周期和倍率，不需要套餐。</p><button className={`button ${data.mode === "direct" ? "primary" : ""}`} disabled={busy || data.mode === "direct" || blockerTotal > 0} onClick={() => switchMode("direct")}>{data.mode === "direct" ? "当前模式" : "切换到逐节点模式"}</button></article></div>
   </Page>;
 }
 
@@ -488,9 +541,9 @@ function App() {
   return <Routes>
     <Route path="/" element={<Navigate to={user ? "/app" : "/login"} replace />} />
     <Route path="/login" element={<Login />} /><Route path="/admin/login" element={<Login admin />} /><Route path="/invite/:token" element={<Invite />} />
-    <Route path="/app" element={<UserArea><UserDashboard /></UserArea>} /><Route path="/app/plans" element={<UserArea><Plans /></UserArea>} /><Route path="/app/subscription" element={<UserArea><Subscription /></UserArea>} /><Route path="/app/usage" element={<UserArea><Usage /></UserArea>} /><Route path="/app/orders" element={<UserArea><Orders /></UserArea>} />
-    <Route path="/admin" element={<AdminArea><AdminDashboard /></AdminArea>} /><Route path="/admin/nodes" element={<AdminArea><AdminNodes /></AdminArea>} /><Route path="/admin/deploy" element={<AdminArea><NodeDeploy returnTo="/admin/nodes" /></AdminArea>} /><Route path="/admin/users" element={<AdminArea><AdminUsers /></AdminArea>} /><Route path="/admin/earnings" element={<AdminArea><AdminEarnings /></AdminArea>} />
-    <Route path="/owner" element={<OwnerArea><OwnerDashboard /></OwnerArea>} /><Route path="/owner/nodes" element={<OwnerArea><OwnerNodes /></OwnerArea>} /><Route path="/owner/deploy" element={<OwnerArea><NodeDeploy returnTo="/owner/nodes" /></OwnerArea>} /><Route path="/owner/backends" element={<OwnerArea><OwnerBackends /></OwnerArea>} /><Route path="/owner/plans" element={<OwnerArea><OwnerPlans /></OwnerArea>} /><Route path="/owner/users" element={<OwnerArea><OwnerUsers /></OwnerArea>} /><Route path="/owner/payments" element={<OwnerArea><OwnerPayments /></OwnerArea>} /><Route path="/owner/orders" element={<OwnerArea><OwnerOrders /></OwnerArea>} /><Route path="/owner/withdrawals" element={<OwnerArea><OwnerWithdrawals /></OwnerArea>} /><Route path="/owner/audit" element={<OwnerArea><OwnerAudit /></OwnerArea>} />
+    <Route path="/app" element={<UserArea><UserDashboard /></UserArea>} /><Route path="/app/plans" element={<ModeOnly siteMode="plan"><UserArea><Plans /></UserArea></ModeOnly>} /><Route path="/app/subscription" element={<UserArea><Subscription /></UserArea>} /><Route path="/app/usage" element={<UserArea><Usage /></UserArea>} /><Route path="/app/orders" element={<UserArea><Orders /></UserArea>} />
+    <Route path="/admin" element={<AdminArea><AdminDashboard /></AdminArea>} /><Route path="/admin/nodes" element={<AdminArea><AdminNodes /></AdminArea>} /><Route path="/admin/deploy" element={<AdminArea><NodeDeploy returnTo="/admin/nodes" /></AdminArea>} /><Route path="/admin/users" element={<AdminArea><AdminUsers /></AdminArea>} /><Route path="/admin/earnings" element={<ModeOnly siteMode="plan"><AdminArea><AdminEarnings /></AdminArea></ModeOnly>} />
+    <Route path="/owner" element={<OwnerArea><OwnerDashboard /></OwnerArea>} /><Route path="/owner/nodes" element={<OwnerArea><OwnerNodes /></OwnerArea>} /><Route path="/owner/deploy" element={<OwnerArea><NodeDeploy returnTo="/owner/nodes" /></OwnerArea>} /><Route path="/owner/backends" element={<OwnerArea><OwnerBackends /></OwnerArea>} /><Route path="/owner/plans" element={<ModeOnly siteMode="plan"><OwnerArea><OwnerPlans /></OwnerArea></ModeOnly>} /><Route path="/owner/grants" element={<ModeOnly siteMode="direct"><OwnerArea><OwnerGrants /></OwnerArea></ModeOnly>} /><Route path="/owner/users" element={<OwnerArea><OwnerUsers /></OwnerArea>} /><Route path="/owner/payments" element={<ModeOnly siteMode="plan"><OwnerArea><OwnerPayments /></OwnerArea></ModeOnly>} /><Route path="/owner/orders" element={<ModeOnly siteMode="plan"><OwnerArea><OwnerOrders /></OwnerArea></ModeOnly>} /><Route path="/owner/withdrawals" element={<ModeOnly siteMode="plan"><OwnerArea><OwnerWithdrawals /></OwnerArea></ModeOnly>} /><Route path="/owner/audit" element={<OwnerArea><OwnerAudit /></OwnerArea>} /><Route path="/owner/settings" element={<OwnerArea><OwnerSettings /></OwnerArea>} />
     <Route path="*" element={<NotFound />} />
   </Routes>;
 }

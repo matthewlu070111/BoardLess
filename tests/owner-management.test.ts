@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { LocalDatabase } from "../src/node/database";
 import { app } from "../src/worker/index";
+import { signSubscriptionToken } from "../src/worker/auth";
 import { sha256 } from "../src/worker/db";
 import type { Env } from "../src/worker/types";
 
@@ -50,6 +51,16 @@ describe("owner account and node management", () => {
 
     const modeResponse = await app.request("http://localhost/api/owner/settings/node-authorization", { method: "PUT", headers, body: JSON.stringify({ mode: "user" }) }, env);
     expect(modeResponse.status).toBe(200);
+    await db.prepare("UPDATE entitlements SET status = 'closed', closed_at = ? WHERE id = 'entitlement'").bind(timestamp).run();
+    const configResponse = await app.request("http://localhost/api/node/v1/config", { headers: { authorization: "Bearer node-token" } }, env);
+    expect(configResponse.status).toBe(200);
+    const directConfig = await configResponse.json() as { authorizationMode: string; users: Array<{ id: string; unlimited: boolean; expiresAt: null; quotaBytes: null }> };
+    expect(directConfig.authorizationMode).toBe("user");
+    expect(directConfig.users).toContainEqual(expect.objectContaining({ id: "user", unlimited: true, expiresAt: null, quotaBytes: null }));
+    const subscriptionToken = await signSubscriptionToken(env.SESSION_SECRET, "user", 1);
+    const subscriptionResponse = await app.request(`http://localhost/sub/${subscriptionToken}?target=shadowrocket`, {}, env);
+    expect(subscriptionResponse.status).toBe(200);
+    expect(Buffer.from(await subscriptionResponse.text(), "base64").toString("utf8")).toContain("node.example.com");
     const directUsageResponse = await app.request("http://localhost/api/node/v1/usage", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer node-token" }, body: JSON.stringify({ reportId: "direct-report", entries: [{ userId: "user", upBytes: 40, downBytes: 60 }] }) }, env);
     expect(directUsageResponse.status).toBe(200);
     expect(await db.prepare("SELECT up_bytes, down_bytes FROM quota_usage WHERE user_id = 'user'").first()).toEqual({ up_bytes: 220, down_bytes: 330 });

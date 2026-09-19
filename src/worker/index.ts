@@ -167,10 +167,16 @@ app.get("/api/app/usage", async (c) => {
 
 app.get("/api/app/subscription", async (c) => {
   const user = c.get("user");
-  const active = await c.env.DB.prepare("SELECT 1 FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? LIMIT 1")
-    .bind(user.id, now(), now()).first();
+  const authorizationMode = await nodeAuthorizationMode(c.env);
+  const active = authorizationMode === "plan"
+    ? await c.env.DB.prepare("SELECT 1 FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? LIMIT 1").bind(user.id, now(), now()).first()
+    : await c.env.DB.prepare(
+      `SELECT 1 FROM user_nodes un JOIN nodes n ON n.id = un.node_id JOIN users owner ON owner.id = n.owner_admin_id
+       LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
+       WHERE un.user_id = ? AND n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL LIMIT 1`,
+    ).bind(user.id).first();
   const token = await signSubscriptionToken(c.env.SESSION_SECRET, user.id, user.subscriptionVersion);
-  return c.json({ active: Boolean(active), baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "shadowrocket", "singbox", "surge"] });
+  return c.json({ active: Boolean(active), authorizationMode, baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "shadowrocket", "singbox", "surge"] });
 });
 
 app.post("/api/app/subscription/rotate", async (c) => {
@@ -874,7 +880,7 @@ app.delete("/api/owner/nodes/:id", async (c) => {
   const id = c.req.param("id");
   const node = await c.env.DB.prepare("SELECT id, name FROM nodes WHERE id = ?").bind(id).first<{ id: string; name: string }>();
   if (!node) return c.json({ error: "节点不存在" }, 404);
-  const history = await c.env.DB.prepare("SELECT 1 FROM usage_entries WHERE node_id = ? LIMIT 1").bind(id).first();
+  const history = await c.env.DB.prepare("SELECT 1 FROM usage_entries WHERE node_id = ? UNION SELECT 1 FROM direct_usage_entries WHERE node_id = ? LIMIT 1").bind(id, id).first();
   if (history) return c.json({ error: "节点已有用量记录，不能删除；可改为归档以保留账务历史" }, 400);
   await c.env.DB.batch([
     c.env.DB.prepare("DELETE FROM plan_nodes WHERE node_id = ?").bind(id),
@@ -1175,20 +1181,27 @@ app.get("/api/node/v1/config", async (c) => {
   if (!node) return c.json({ error: "节点令牌无效" }, 401);
   const timestamp = now();
   const authorizationMode = await nodeAuthorizationMode(c.env);
-  const users = node.status === "approved" ? await c.env.DB.prepare(
-    `SELECT DISTINCT u.id, u.access_uuid, u.access_secret, e.ends_at, e.quota_bytes,
-      COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
-     FROM entitlements e
-     JOIN users u ON u.id = e.user_id
-     LEFT JOIN quota_usage q ON q.user_id = u.id AND q.month_key = ?
-     WHERE e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? AND u.status = 'active'
-       AND ((? = 'plan' AND EXISTS (SELECT 1 FROM plan_nodes pn WHERE pn.plan_id = e.plan_id AND pn.node_id = ?))
-         OR (? = 'user' AND EXISTS (SELECT 1 FROM user_nodes un WHERE un.user_id = u.id AND un.node_id = ?)))
-       AND COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) < e.quota_bytes`,
-  ).bind(monthKey(), timestamp, timestamp, authorizationMode, node.id, authorizationMode, node.id).all<Record<string, unknown>>() : { results: [] };
+  const users = node.status !== "approved" ? { results: [] as Record<string, unknown>[] } : authorizationMode === "plan"
+    ? await c.env.DB.prepare(
+      `SELECT DISTINCT u.id, u.access_uuid, u.access_secret, e.ends_at, e.quota_bytes,
+        COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
+       FROM entitlements e JOIN users u ON u.id = e.user_id
+       JOIN plan_nodes pn ON pn.plan_id = e.plan_id AND pn.node_id = ?
+       LEFT JOIN quota_usage q ON q.user_id = u.id AND q.month_key = ?
+       WHERE e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? AND u.status = 'active'
+         AND COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) < e.quota_bytes`,
+    ).bind(node.id, monthKey(), timestamp, timestamp).all<Record<string, unknown>>()
+    : await c.env.DB.prepare(
+      `SELECT u.id, u.access_uuid, u.access_secret, NULL AS ends_at, NULL AS quota_bytes,
+        COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
+       FROM user_nodes un JOIN users u ON u.id = un.user_id
+       LEFT JOIN quota_usage q ON q.user_id = u.id AND q.month_key = ?
+       WHERE un.node_id = ? AND u.status = 'active'`,
+    ).bind(monthKey(), node.id).all<Record<string, unknown>>();
   return c.json({
     node: { id: node.id, name: node.name, protocol: node.protocol, status: node.status, config: JSON.parse(node.config_json), updatedAt: node.updated_at },
-    users: users.results.map((user) => ({ id: user.id, uuid: user.access_uuid, secret: user.access_secret, expiresAt: user.ends_at, quotaBytes: user.quota_bytes, usedBytes: user.used_bytes })),
+    authorizationMode,
+    users: users.results.map((user) => ({ id: user.id, uuid: user.access_uuid, secret: user.access_secret, expiresAt: user.ends_at, quotaBytes: user.quota_bytes, usedBytes: user.used_bytes, unlimited: authorizationMode === "user" })),
     generatedAt: timestamp,
   });
 });
@@ -1223,26 +1236,28 @@ app.post("/api/node/v1/usage", async (c) => {
     const up = Math.floor(Number(entry.upBytes));
     const down = Math.floor(Number(entry.downBytes));
     if (!entry.userId || !Number.isSafeInteger(up) || !Number.isSafeInteger(down) || up < 0 || down < 0 || up + down === 0) continue;
-    const entitlement = await c.env.DB.prepare(
-      `SELECT e.id, CASE WHEN ? = 'plan'
-          THEN COALESCE((SELECT pn.multiplier_bps FROM plan_nodes pn WHERE pn.plan_id = e.plan_id AND pn.node_id = ?), 0)
-          ELSE COALESCE((SELECT un.multiplier_bps FROM user_nodes un WHERE un.user_id = e.user_id AND un.node_id = ?), 0)
-        END AS multiplier_bps FROM entitlements e
-       WHERE e.user_id = ? AND e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ?
-         AND ((? = 'plan' AND EXISTS (SELECT 1 FROM plan_nodes pn WHERE pn.plan_id = e.plan_id AND pn.node_id = ?))
-           OR (? = 'user' AND EXISTS (SELECT 1 FROM user_nodes un WHERE un.user_id = e.user_id AND un.node_id = ?))) LIMIT 1`,
-    ).bind(authorizationMode, node.id, node.id, entry.userId, timestamp, timestamp, authorizationMode, node.id, authorizationMode, node.id).first<{ id: string; multiplier_bps: number }>();
-    if (!entitlement) continue;
-    const chargedUp = Math.floor(up * Number(entitlement.multiplier_bps || 10000) / 10000);
-    const chargedDown = Math.floor(down * Number(entitlement.multiplier_bps || 10000) / 10000);
-    statements.push(
-      c.env.DB.prepare("INSERT INTO usage_entries (id, report_id, node_id, user_id, entitlement_id, up_bytes, down_bytes, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(newId("usage"), input.reportId, node.id, entry.userId, entitlement.id, up, down, timestamp),
+    const access = authorizationMode === "plan"
+      ? await c.env.DB.prepare(
+        `SELECT e.id AS entitlement_id, pn.multiplier_bps FROM entitlements e
+         JOIN plan_nodes pn ON pn.plan_id = e.plan_id AND pn.node_id = ?
+         WHERE e.user_id = ? AND e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? LIMIT 1`,
+      ).bind(node.id, entry.userId, timestamp, timestamp).first<{ entitlement_id: string; multiplier_bps: number }>()
+      : await c.env.DB.prepare(
+        `SELECT NULL AS entitlement_id, un.multiplier_bps FROM user_nodes un JOIN users u ON u.id = un.user_id
+         WHERE un.user_id = ? AND un.node_id = ? AND u.status = 'active' LIMIT 1`,
+      ).bind(entry.userId, node.id).first<{ entitlement_id: null; multiplier_bps: number }>();
+    if (!access) continue;
+    const chargedUp = Math.floor(up * Number(access.multiplier_bps || 10000) / 10000);
+    const chargedDown = Math.floor(down * Number(access.multiplier_bps || 10000) / 10000);
+    statements.push(authorizationMode === "plan"
+      ? c.env.DB.prepare("INSERT INTO usage_entries (id, report_id, node_id, user_id, entitlement_id, up_bytes, down_bytes, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(newId("usage"), input.reportId, node.id, entry.userId, access.entitlement_id, up, down, timestamp)
+      : c.env.DB.prepare("INSERT INTO direct_usage_entries (id, report_id, node_id, user_id, up_bytes, down_bytes, charged_up_bytes, charged_down_bytes, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(newId("usage"), input.reportId, node.id, entry.userId, up, down, chargedUp, chargedDown, timestamp),
       c.env.DB.prepare(
         `INSERT INTO quota_usage (user_id, month_key, up_bytes, down_bytes) VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, month_key) DO UPDATE SET up_bytes = up_bytes + excluded.up_bytes, down_bytes = down_bytes + excluded.down_bytes`,
-      ).bind(entry.userId, monthKey(timestamp), chargedUp, chargedDown),
-    );
+      ).bind(entry.userId, monthKey(timestamp), chargedUp, chargedDown));
     accepted++;
   }
   try { await c.env.DB.batch(statements); }
@@ -1260,14 +1275,14 @@ app.get("/sub/:token", async (c) => {
   const user = await loadUser(c.env, parsed.userId);
   if (!user || user.status !== "active" || user.subscriptionVersion !== parsed.version) return c.text("订阅链接已失效", 410);
   const timestamp = now();
-  const entitlement = await c.env.DB.prepare(
+  const authorizationMode = await nodeAuthorizationMode(c.env);
+  const entitlement = authorizationMode === "plan" ? await c.env.DB.prepare(
     "SELECT id, plan_id, quota_bytes FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? ORDER BY ends_at DESC LIMIT 1",
-  ).bind(user.id, timestamp, timestamp).first<{ id: string; plan_id: string; quota_bytes: number }>();
-  if (!entitlement) return c.text("当前没有有效套餐", 403);
+  ).bind(user.id, timestamp, timestamp).first<{ id: string; plan_id: string; quota_bytes: number }>() : null;
+  if (authorizationMode === "plan" && !entitlement) return c.text("当前没有有效套餐", 403);
   const usage = await c.env.DB.prepare("SELECT up_bytes + down_bytes AS used FROM quota_usage WHERE user_id = ? AND month_key = ?")
     .bind(user.id, monthKey(timestamp)).first<{ used: number }>();
-  if (Number(usage?.used || 0) >= entitlement.quota_bytes) return c.text("本月流量已用尽", 403);
-  const authorizationMode = await nodeAuthorizationMode(c.env);
+  if (entitlement && Number(usage?.used || 0) >= entitlement.quota_bytes) return c.text("本月流量已用尽", 403);
   const accessSql = authorizationMode === "plan"
     ? "SELECT node_id, multiplier_bps FROM plan_nodes WHERE plan_id = ?"
     : "SELECT node_id, multiplier_bps FROM user_nodes WHERE user_id = ?";
@@ -1277,10 +1292,12 @@ app.get("/sub/:token", async (c) => {
      LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
      WHERE n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL
      ORDER BY n.name`,
-  ).bind(authorizationMode === "plan" ? entitlement.plan_id : user.id).all<NodeRow>();
+  ).bind(authorizationMode === "plan" ? entitlement!.plan_id : user.id).all<NodeRow>();
+  if (authorizationMode === "user" && !nodes.results.length) return c.text("当前没有已分配节点", 403);
   try {
     const result = renderSubscription(c.req.query("target") || "clash", nodes.results, { uuid: user.accessUuid, secret: user.accessSecret });
-    const headers = new Headers({ "content-type": result.contentType, "cache-control": "no-store, private", "subscription-userinfo": `upload=${Number(usage?.used || 0)}; download=0; total=${entitlement.quota_bytes}` });
+    const headers = new Headers({ "content-type": result.contentType, "cache-control": "no-store, private" });
+    if (entitlement) headers.set("subscription-userinfo", `upload=${Number(usage?.used || 0)}; download=0; total=${entitlement.quota_bytes}`);
     if (result.skipped.length) headers.set("x-boardless-skipped", encodeURIComponent(result.skipped.join(",")));
     return new Response(result.body, { headers });
   } catch (error) { return c.text(error instanceof Error ? error.message : "订阅生成失败", 400); }

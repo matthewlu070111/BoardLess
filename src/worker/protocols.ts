@@ -4,6 +4,53 @@ import type { NodeRow, Protocol } from "./types";
 type Config = Record<string, unknown>;
 type Credential = { uuid: string; secret: string };
 
+type ServiceRule = {
+  tag: string;
+  clashTag: string;
+  domain: string[];
+  ip?: string[];
+};
+
+const RULE_SOURCE = "https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/meta";
+const SERVICE_RULES: ServiceRule[] = [
+  { tag: "AI", clashTag: "🤖 AI", domain: ["category-ai-!cn"] },
+  { tag: "YouTube", clashTag: "📹 YouTube", domain: ["youtube"] },
+  { tag: "Google", clashTag: "🍀 Google", domain: ["google"], ip: ["google"] },
+  { tag: "GitHub", clashTag: "👨‍💻 GitHub", domain: ["github"] },
+  { tag: "OneDrive", clashTag: "🐬 OneDrive", domain: ["onedrive"] },
+  { tag: "Microsoft", clashTag: "🪟 Microsoft", domain: ["microsoft"] },
+  { tag: "Apple", clashTag: "🍎 Apple", domain: ["apple"], ip: ["apple"] },
+  { tag: "Telegram", clashTag: "📲 Telegram", domain: ["telegram"], ip: ["telegram"] },
+  { tag: "TikTok", clashTag: "🎵 TikTok", domain: ["tiktok"] },
+  { tag: "Netflix", clashTag: "🎥 Netflix", domain: ["netflix"], ip: ["netflix"] },
+  { tag: "Wallet", clashTag: "💶 Wallet", domain: ["paypal", "binance", "okx", "category-cryptocurrency"] },
+  { tag: "Steam", clashTag: "🎮 Steam", domain: ["steam"] },
+];
+
+const DIRECT_DOMAIN_RULES = ["microsoft@cn", "apple@cn", "steam@cn"];
+
+function clashRuleProvider(kind: "geosite" | "geoip", name: string): Config {
+  const directory = kind === "geoip" && name === "apple" ? "geo-lite/geoip" : `geo/${kind}`;
+  return {
+    type: "http",
+    behavior: kind === "geosite" ? "domain" : "ipcidr",
+    format: "mrs",
+    interval: 86400,
+    url: `${RULE_SOURCE}/${directory}/${name}.mrs`,
+  };
+}
+
+function singboxRuleSet(kind: "geosite" | "geoip", name: string, downloadDetour: string): Config {
+  const directory = kind === "geoip" && name === "apple" ? "geo-lite/geoip" : `geo/${kind}`;
+  return {
+    type: "remote",
+    tag: `${kind}-${name}`,
+    format: "binary",
+    url: `${RULE_SOURCE}/sing/${directory}/${name}.srs`,
+    download_detour: downloadDetour,
+  };
+}
+
 const METHODS = new Set(["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"]);
 const TRANSPORTS = new Set(["tcp", "ws", "grpc"]);
 
@@ -131,14 +178,44 @@ export function renderSubscription(target: string, nodes: NodeRow[], credential:
   if (target === "clash") {
     const proxies = parsed.map(({ node, config }) => clashNode(node, config, credential));
     const names = proxies.map((proxy) => String(proxy.name));
-    const groups = names.length ? [
-      { name: "Proxy", type: "select", proxies: ["Auto", ...names, "DIRECT"] },
-      { name: "Auto", type: "url-test", proxies: names, url: "https://www.gstatic.com/generate_204", interval: 300 },
-    ] : [{ name: "Proxy", type: "select", proxies: ["DIRECT"] }];
+    const proxyChoices = names.length ? ["Auto", ...names, "DIRECT"] : ["DIRECT"];
+    const serviceChoices = names.length ? ["Proxy", "Auto", ...names, "DIRECT"] : ["DIRECT"];
+    const groups: Config[] = [
+      { name: "Proxy", type: "select", proxies: proxyChoices },
+      ...(names.length ? [{ name: "Auto", type: "url-test", proxies: names, url: "https://www.gstatic.com/generate_204", interval: 300, tolerance: 100 }] : []),
+      ...SERVICE_RULES.map((service) => ({ name: service.clashTag, type: "select", proxies: [...serviceChoices] })),
+      { name: "🐟 Final", type: "select", proxies: names.length ? ["Proxy", "Auto", ...names, "DIRECT"] : ["DIRECT"] },
+    ];
+    const ruleProviders: Config = {
+      "private-domain": clashRuleProvider("geosite", "private"),
+      "private-ip": clashRuleProvider("geoip", "private"),
+      ...Object.fromEntries(DIRECT_DOMAIN_RULES.map((name) => [`${name}-domain`, clashRuleProvider("geosite", name)])),
+      ...Object.fromEntries(SERVICE_RULES.flatMap((service) => [
+        ...service.domain.map((name) => [`${name}-domain`, clashRuleProvider("geosite", name)] as const),
+        ...(service.ip || []).map((name) => [`${name}-ip`, clashRuleProvider("geoip", name)] as const),
+      ])),
+      "geolocation-!cn-domain": clashRuleProvider("geosite", "geolocation-!cn"),
+      "cn-domain": clashRuleProvider("geosite", "cn"),
+      "cn-ip": clashRuleProvider("geoip", "cn"),
+    };
+    const rules = [
+      "RULE-SET,private-ip,DIRECT,no-resolve",
+      "RULE-SET,private-domain,DIRECT",
+      ...DIRECT_DOMAIN_RULES.map((name) => `RULE-SET,${name}-domain,DIRECT`),
+      ...SERVICE_RULES.flatMap((service) => [
+        ...service.domain.map((name) => `RULE-SET,${name}-domain,${service.clashTag}`),
+        ...(service.ip || []).map((name) => `RULE-SET,${name}-ip,${service.clashTag},no-resolve`),
+      ]),
+      "RULE-SET,geolocation-!cn-domain,Proxy",
+      "RULE-SET,cn-domain,DIRECT",
+      "RULE-SET,cn-ip,DIRECT,no-resolve",
+      "MATCH,🐟 Final",
+    ];
     return { body: YAML.stringify({
       "mixed-port": 7890, "allow-lan": false, mode: "rule", "log-level": "info", proxies,
       "proxy-groups": groups,
-      rules: ["GEOIP,CN,DIRECT", "MATCH,Proxy"],
+      "rule-providers": ruleProviders,
+      rules,
     }), contentType: "text/yaml; charset=utf-8", skipped: [] as string[] };
   }
   if (target === "singbox") {
@@ -147,17 +224,45 @@ export function renderSubscription(target: string, nodes: NodeRow[], credential:
     const routingOutbounds: Config[] = tags.length ? [
       { type: "selector", tag: "Proxy", outbounds: ["Auto", ...tags, "direct"] },
       { type: "urltest", tag: "Auto", outbounds: tags, url: "https://www.gstatic.com/generate_204", interval: "5m" },
+      ...SERVICE_RULES.map((service) => ({ type: "selector", tag: service.tag, outbounds: ["Proxy", "Auto", ...tags, "direct"] })),
+      { type: "selector", tag: "Final", outbounds: ["Proxy", "Auto", ...tags, "direct"] },
       { type: "direct", tag: "direct" },
-    ] : [{ type: "direct", tag: "Proxy" }];
+    ] : [
+      { type: "direct", tag: "Proxy" },
+      ...SERVICE_RULES.map((service) => ({ type: "selector", tag: service.tag, outbounds: ["Proxy"] })),
+      { type: "selector", tag: "Final", outbounds: ["Proxy"] },
+      { type: "direct", tag: "direct" },
+    ];
+    const ruleSet = [
+      singboxRuleSet("geosite", "private", "Proxy"),
+      singboxRuleSet("geoip", "private", "Proxy"),
+      ...DIRECT_DOMAIN_RULES.map((name) => singboxRuleSet("geosite", name, "Proxy")),
+      ...SERVICE_RULES.flatMap((service) => [
+        ...service.domain.map((name) => singboxRuleSet("geosite", name, "Proxy")),
+        ...(service.ip || []).map((name) => singboxRuleSet("geoip", name, "Proxy")),
+      ]),
+      singboxRuleSet("geosite", "geolocation-!cn", "Proxy"),
+      singboxRuleSet("geosite", "cn", "Proxy"),
+      singboxRuleSet("geoip", "cn", "Proxy"),
+    ];
+    const routeRules: Config[] = [
+      { action: "sniff" },
+      { ip_is_private: true, outbound: "direct" },
+      { rule_set: ["geosite-private", "geoip-private"], outbound: "direct" },
+      ...DIRECT_DOMAIN_RULES.map((name) => ({ rule_set: `geosite-${name}`, outbound: "direct" })),
+      ...SERVICE_RULES.flatMap((service) => [
+        ...service.domain.map((name) => ({ rule_set: `geosite-${name}`, outbound: service.tag })),
+        ...(service.ip || []).map((name) => ({ rule_set: `geoip-${name}`, outbound: service.tag })),
+      ]),
+      { rule_set: "geosite-geolocation-!cn", outbound: "Proxy" },
+      { rule_set: ["geosite-cn", "geoip-cn"], outbound: "direct" },
+    ];
     return { body: JSON.stringify({
       outbounds: [...nodeOutbounds, ...routingOutbounds],
       route: {
-        rules: [{ action: "sniff" }, { ip_is_private: true, outbound: "direct" }, { rule_set: ["geosite-cn", "geoip-cn"], outbound: "direct" }],
-        rule_set: [
-          { type: "remote", tag: "geosite-cn", format: "binary", url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", download_detour: "Proxy" },
-          { type: "remote", tag: "geoip-cn", format: "binary", url: "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs", download_detour: "Proxy" },
-        ],
-        final: "Proxy",
+        rules: routeRules,
+        rule_set: ruleSet,
+        final: "Final",
       },
     }, null, 2), contentType: "application/json; charset=utf-8", skipped: [] as string[] };
   }

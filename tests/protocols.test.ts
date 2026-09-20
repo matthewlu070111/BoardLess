@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import YAML from "yaml";
 import { renderSubscription, validateNodeConfig } from "../src/worker/protocols";
 import type { NodeRow, Protocol } from "../src/worker/types";
 
@@ -31,12 +32,33 @@ describe("protocol validation and rendering", () => {
     const singbox = renderSubscription("singbox", nodes(), credential);
     expect(clash.body).toContain("hysteria2");
     expect(clash.body).toContain("tuic");
-    expect(clash.body).toContain("proxy-groups:");
-    expect(clash.body).toContain("GEOIP,CN,DIRECT");
+    const clashConfig = YAML.parse(clash.body);
+    expect(clashConfig["proxy-groups"].map((group: { name: string }) => group.name)).toEqual(expect.arrayContaining([
+      "Proxy", "Auto", "🤖 AI", "📹 YouTube", "🍀 Google", "👨‍💻 GitHub", "📲 Telegram", "🎥 Netflix", "🐟 Final",
+    ]));
+    expect(Object.keys(clashConfig["rule-providers"])).toEqual(expect.arrayContaining([
+      "category-ai-!cn-domain", "youtube-domain", "google-domain", "telegram-ip", "netflix-domain", "cn-domain", "cn-ip",
+    ]));
+    expect(clashConfig.rules).toEqual(expect.arrayContaining([
+      "RULE-SET,category-ai-!cn-domain,🤖 AI",
+      "RULE-SET,microsoft@cn-domain,DIRECT",
+      "RULE-SET,geolocation-!cn-domain,Proxy",
+      "RULE-SET,cn-ip,DIRECT,no-resolve",
+      "MATCH,🐟 Final",
+    ]));
     const singboxConfig = JSON.parse(singbox.body);
     expect(singboxConfig.outbounds.filter((outbound: { server?: string }) => outbound.server)).toHaveLength(6);
-    expect(singboxConfig.route.final).toBe("Proxy");
-    expect(singboxConfig.route.rule_set).toHaveLength(2);
+    expect(singboxConfig.outbounds.map((outbound: { tag: string }) => outbound.tag)).toEqual(expect.arrayContaining([
+      "Proxy", "Auto", "AI", "YouTube", "Google", "GitHub", "Telegram", "Netflix", "Final", "direct",
+    ]));
+    expect(singboxConfig.route.final).toBe("Final");
+    expect(singboxConfig.route.rule_set).toHaveLength(27);
+    expect(singboxConfig.route.rules).toEqual(expect.arrayContaining([
+      { rule_set: "geosite-category-ai-!cn", outbound: "AI" },
+      { rule_set: "geosite-microsoft@cn", outbound: "direct" },
+      { rule_set: "geosite-geolocation-!cn", outbound: "Proxy" },
+      { rule_set: ["geosite-cn", "geoip-cn"], outbound: "direct" },
+    ]));
   });
 
   it("renders a plain Shadowrocket node subscription and exposes node multipliers", () => {
@@ -48,6 +70,15 @@ describe("protocol validation and rendering", () => {
     expect(decoded).toContain(encodeURIComponent("Test shadowsocks [2.5x]"));
     expect(decoded.split("\n")).toHaveLength(6);
     expect(result.skipped).toEqual([]);
+  });
+
+  it("keeps rule targets valid when a subscription has no nodes", () => {
+    const clashConfig = YAML.parse(renderSubscription("clash", [], credential).body);
+    expect(clashConfig["proxy-groups"].find((group: { name: string }) => group.name === "Proxy").proxies).toEqual(["DIRECT"]);
+
+    const singboxConfig = JSON.parse(renderSubscription("singbox", [], credential).body);
+    expect(singboxConfig.outbounds.map((outbound: { tag: string }) => outbound.tag)).toEqual(expect.arrayContaining(["Proxy", "Final", "direct"]));
+    expect(singboxConfig.outbounds.some((outbound: { tag: string }) => outbound.tag === "Auto")).toBe(false);
   });
 
   it("limits Surge to conservative compatible protocols", () => {

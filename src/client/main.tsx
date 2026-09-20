@@ -235,9 +235,9 @@ function Subscription() {
     {notice && <Notice tone="success">{notice}</Notice>}
     {!data.active && <Notice tone="danger">当前没有可用的套餐或节点授权，订阅暂不可用。</Notice>}
     <div className="card-grid targets">{[
-      ["clash", "Clash Meta", "YAML · 内置分流规则"], ["shadowrocket", "Shadowrocket", "节点订阅"], ["singbox", "sing-box", "JSON · 内置分流规则"], ["surge", "Surge", "SS / Trojan"],
+      ["clash", "Clash Meta", "YAML · 通用精细分流"], ["shadowrocket", "Shadowrocket", "节点订阅"], ["singbox", "sing-box", "JSON · 通用精细分流"], ["surge", "Surge", "SS / Trojan"],
     ].map(([id, name, meta]) => <article className="target-card" key={id}><div className="target-icon">{name[0]}</div><div><h3>{name}</h3><p>{meta}</p></div><button className="button" disabled={!data.active} onClick={() => copy(id)}>复制链接</button></article>)}</div>
-    <section className="panel"><h2>兼容说明</h2><p className="muted">Clash Meta 与 sing-box 输出包含国内直连、其余流量走代理的分流配置，并支持全部六类协议。Shadowrocket 输出普通节点订阅，不附带分流规则。Surge 仅输出 Shadowsocks 和 Trojan；不兼容节点会通过响应头标明。</p></section>
+    <section className="panel"><h2>兼容说明</h2><p className="muted">Clash Meta 与 sing-box 输出包含 AI、流媒体、社交、开发、办公、游戏平台等独立策略组，以及私网 / 国内直连和漏网流量策略，并支持全部六类协议。规则集每天由客户端自动更新。Shadowrocket 输出普通节点订阅，不附带分流规则。Surge 仅输出 Shadowsocks 和 Trojan；不兼容节点会通过响应头标明。</p></section>
   </Page>;
 }
 

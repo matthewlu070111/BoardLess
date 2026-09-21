@@ -476,6 +476,7 @@ POST /api/admin/withdrawals
 | `GET` | `/api/owner/plans` | 全部套餐 |
 | `POST` | `/api/owner/plans` | 创建套餐 |
 | `PATCH` | `/api/owner/plans/:id` | 更新套餐完整配置 |
+| `DELETE` | `/api/owner/plans/:id` | 删除套餐；`?force=true` 可彻底删除关联订单、权益、用量、账本和支付事件 |
 | `GET` | `/api/owner/users` | 全站账号，最多 500 条 |
 | `PATCH` | `/api/owner/users/:id` | `{ status?, commissionBps? }` |
 | `POST` | `/api/owner/invitations` | 创建管理员邀请 |
@@ -487,6 +488,8 @@ POST /api/admin/withdrawals
 站长创建的节点直接为 `approved`。但站长只能编辑、归档和轮换自己创建的节点；可通过 `action` 接口审核或停用任意节点。
 
 普通删除会移除节点的套餐关系、用户授权、安装令牌和上报去重记录；如节点已有用量历史，接口返回 `409`、`requiresForce: true` 及关联数量。只有用户明确确认后才应改用 `?force=true`。强制删除还会清除该节点的套餐模式与逐节点模式用量明细，影响后续用量和收益统计，但不会自动回滚已经写入的收益账本。
+
+套餐普通删除只允许无订单、无权益历史的套餐。冲突时接口返回 `409`、`requiresForce: true` 及关联数量。`?force=true` 会删除套餐关联的订单、权益、用量明细、钱包账本、收益账本和支付事件，并清空其他订单中指向被删权益的升级来源；用户月度累计流量 `quota_usage` 无法按套餐拆分，因此保留。
 
 ### 创建套餐
 

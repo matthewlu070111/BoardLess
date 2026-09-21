@@ -166,11 +166,19 @@ describe("owner account and node management", () => {
       db.prepare("INSERT INTO nodes (id, owner_admin_id, name, protocol, status, config_json, token_hash, created_at, updated_at) VALUES ('node', 'owner', 'Node', 'shadowsocks', 'approved', '{}', 'token-hash', ?, ?)").bind(timestamp, timestamp),
       db.prepare("INSERT INTO plans (id, name, price_cents, duration_days, quota_bytes, created_at, updated_at) VALUES ('used-plan', 'Used', 1000, 30, 10000, ?, ?)").bind(timestamp, timestamp),
       db.prepare("INSERT INTO plans (id, name, price_cents, duration_days, quota_bytes, created_at, updated_at) VALUES ('unused-plan', 'Unused', 500, 7, 5000, ?, ?)").bind(timestamp, timestamp),
+      db.prepare("INSERT INTO plans (id, name, price_cents, duration_days, quota_bytes, created_at, updated_at) VALUES ('other-plan', 'Other', 500, 7, 5000, ?, ?)").bind(timestamp, timestamp),
+      db.prepare("INSERT INTO plan_nodes (plan_id, node_id) VALUES ('used-plan', 'node')"),
       db.prepare("INSERT INTO plan_nodes (plan_id, node_id) VALUES ('unused-plan', 'node')"),
       db.prepare("INSERT INTO orders (id, user_id, plan_id, status, price_cents, expires_at, created_at) VALUES ('current-order', 'user', 'used-plan', 'paid', 1000, ?, ?)").bind(timestamp + 3600, timestamp),
       db.prepare("INSERT INTO orders (id, user_id, plan_id, status, price_cents, expires_at, created_at) VALUES ('queued-order', 'user', 'used-plan', 'paid', 1000, ?, ?)").bind(timestamp + 3600, timestamp),
       db.prepare("INSERT INTO entitlements (id, user_id, plan_id, order_id, starts_at, ends_at, original_seconds, price_cents, quota_bytes, node_pool_bps, status) VALUES ('current-entitlement', 'user', 'used-plan', 'current-order', ?, ?, 7200, 1000, 10000, 0, 'active')").bind(timestamp - 60, timestamp + 7140),
       db.prepare("INSERT INTO entitlements (id, user_id, plan_id, order_id, starts_at, ends_at, original_seconds, price_cents, quota_bytes, node_pool_bps, status) VALUES ('queued-entitlement', 'user', 'used-plan', 'queued-order', ?, ?, 7200, 1000, 10000, 0, 'active')").bind(timestamp + 7200, timestamp + 14400),
+      db.prepare("INSERT INTO orders (id, user_id, plan_id, status, price_cents, upgrade_from_entitlement_id, expires_at, created_at) VALUES ('other-order', 'user', 'other-plan', 'pending', 500, 'current-entitlement', ?, ?)").bind(timestamp + 3600, timestamp),
+      db.prepare("INSERT INTO usage_entries (id, report_id, node_id, user_id, entitlement_id, up_bytes, down_bytes, observed_at) VALUES ('usage', 'report', 'node', 'user', 'current-entitlement', 10, 20, ?)").bind(timestamp),
+      db.prepare("INSERT INTO wallet_ledger (id, user_id, order_id, kind, amount_cents, created_at) VALUES ('wallet', 'user', 'current-order', 'purchase', -100, ?)").bind(timestamp),
+      db.prepare("INSERT INTO earnings_ledger (id, admin_id, order_id, entitlement_id, kind, amount_cents, available_at, created_at) VALUES ('earning', 'owner', 'current-order', 'current-entitlement', 'sales_commission', 50, ?, ?)").bind(timestamp, timestamp),
+      db.prepare("INSERT INTO payment_events (event_key, order_id, payload_hash, created_at) VALUES ('event', 'current-order', 'hash', ?)").bind(timestamp),
+      db.prepare("INSERT INTO quota_usage (user_id, month_key, up_bytes, down_bytes) VALUES ('user', '2026-09', 10, 20)"),
     ]);
     const env: Env = { DB: db, ASSETS: {} as Fetcher, APP_ORIGIN: "https://panel.example.com", SESSION_SECRET: "secret", BOOTSTRAP_SECRET: "bootstrap", ALIPAY_APP_ID: "", ALIPAY_PRIVATE_KEY: "", ALIPAY_PUBLIC_KEY: "", ALIPAY_GATEWAY: "" };
     const headers = { "content-type": "application/json", cookie: `boardless_session=${session}` };
@@ -192,13 +200,31 @@ describe("owner account and node management", () => {
 
     const blockedDelete = await app.request("http://localhost/api/owner/plans/used-plan", { method: "DELETE", headers, body: "{}" }, env);
     expect(blockedDelete.status).toBe(409);
+    expect(await blockedDelete.json()).toEqual(expect.objectContaining({ requiresForce: true, dependencies: expect.objectContaining({ orders: 2, entitlements: 2, usageEntries: 1, walletEntries: 1, earningsEntries: 1, paymentEvents: 1 }) }));
     expect(await db.prepare("SELECT id FROM plans WHERE id = 'used-plan'").first()).toEqual({ id: "used-plan" });
+    expect(await db.prepare("SELECT SUM(amount_cents) AS balance FROM wallet_ledger WHERE user_id = 'user'").first()).toEqual({ balance: -100 });
+    expect(await db.prepare("SELECT SUM(amount_cents) AS balance FROM earnings_ledger WHERE admin_id = 'owner'").first()).toEqual({ balance: 50 });
+
+    const forceDelete = await app.request("http://localhost/api/owner/plans/used-plan?force=true", { method: "DELETE", headers, body: "{}" }, env);
+    expect(forceDelete.status).toBe(200);
+    expect(await db.prepare("SELECT id FROM plans WHERE id = 'used-plan'").first()).toBeNull();
+    expect(await db.prepare("SELECT id FROM orders WHERE plan_id = 'used-plan'").first()).toBeNull();
+    expect(await db.prepare("SELECT id FROM entitlements WHERE plan_id = 'used-plan'").first()).toBeNull();
+    expect(await db.prepare("SELECT id FROM usage_entries WHERE id = 'usage'").first()).toBeNull();
+    expect(await db.prepare("SELECT id FROM wallet_ledger WHERE id = 'wallet'").first()).toBeNull();
+    expect(await db.prepare("SELECT id FROM earnings_ledger WHERE id = 'earning'").first()).toBeNull();
+    expect(await db.prepare("SELECT SUM(amount_cents) AS balance FROM wallet_ledger WHERE user_id = 'user'").first()).toEqual({ balance: null });
+    expect(await db.prepare("SELECT SUM(amount_cents) AS balance FROM earnings_ledger WHERE admin_id = 'owner'").first()).toEqual({ balance: null });
+    expect(await db.prepare("SELECT event_key FROM payment_events WHERE event_key = 'event'").first()).toBeNull();
+    expect(await db.prepare("SELECT upgrade_from_entitlement_id FROM orders WHERE id = 'other-order'").first()).toEqual({ upgrade_from_entitlement_id: null });
+    expect(await db.prepare("SELECT up_bytes, down_bytes FROM quota_usage WHERE user_id = 'user' AND month_key = '2026-09'").first()).toEqual({ up_bytes: 10, down_bytes: 20 });
+    expect(await db.prepare("SELECT action FROM audit_logs WHERE subject_id = 'used-plan' ORDER BY created_at DESC LIMIT 1").first()).toEqual({ action: "plan.force_delete" });
 
     const deleteResponse = await app.request("http://localhost/api/owner/plans/unused-plan", { method: "DELETE", headers, body: "{}" }, env);
     expect(deleteResponse.status).toBe(200);
     expect(await db.prepare("SELECT id FROM plans WHERE id = 'unused-plan'").first()).toBeNull();
     expect(await db.prepare("SELECT plan_id FROM plan_nodes WHERE plan_id = 'unused-plan'").first()).toBeNull();
-    expect(await db.prepare("SELECT action FROM audit_logs WHERE action = 'plan.delete'").first()).toEqual({ action: "plan.delete" });
+    expect(await db.prepare("SELECT action FROM audit_logs WHERE subject_id = 'unused-plan'").first()).toEqual({ action: "plan.delete" });
     database.close();
   });
 });

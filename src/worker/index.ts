@@ -79,6 +79,56 @@ async function deleteNode(env: Env, nodeId: string, force: boolean) {
   return { deleted: true as const, dependencies };
 }
 
+type PlanDeleteDependencies = {
+  nodeAssignments: number;
+  orders: number;
+  entitlements: number;
+  usageEntries: number;
+  walletEntries: number;
+  earningsEntries: number;
+  paymentEvents: number;
+};
+
+async function planDeleteDependencies(env: Env, planId: string): Promise<PlanDeleteDependencies> {
+  const row = await env.DB.prepare(
+    `SELECT
+      (SELECT COUNT(*) FROM plan_nodes WHERE plan_id = ?) AS node_assignments,
+      (SELECT COUNT(*) FROM orders WHERE plan_id = ?) AS orders,
+      (SELECT COUNT(*) FROM entitlements WHERE plan_id = ?) AS entitlements,
+      (SELECT COUNT(*) FROM usage_entries WHERE entitlement_id IN (SELECT id FROM entitlements WHERE plan_id = ?)) AS usage_entries,
+      (SELECT COUNT(*) FROM wallet_ledger WHERE order_id IN (SELECT id FROM orders WHERE plan_id = ?)) AS wallet_entries,
+      (SELECT COUNT(*) FROM earnings_ledger WHERE order_id IN (SELECT id FROM orders WHERE plan_id = ?) OR entitlement_id IN (SELECT id FROM entitlements WHERE plan_id = ?)) AS earnings_entries,
+      (SELECT COUNT(*) FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE plan_id = ?)) AS payment_events`,
+  ).bind(planId, planId, planId, planId, planId, planId, planId, planId).first<Record<string, number>>();
+  return {
+    nodeAssignments: Number(row?.node_assignments || 0),
+    orders: Number(row?.orders || 0),
+    entitlements: Number(row?.entitlements || 0),
+    usageEntries: Number(row?.usage_entries || 0),
+    walletEntries: Number(row?.wallet_entries || 0),
+    earningsEntries: Number(row?.earnings_entries || 0),
+    paymentEvents: Number(row?.payment_events || 0),
+  };
+}
+
+async function deletePlan(env: Env, planId: string, force: boolean) {
+  const dependencies = await planDeleteDependencies(env, planId);
+  if (!force && dependencies.orders + dependencies.entitlements > 0) return { deleted: false as const, dependencies };
+  await env.DB.batch([
+    ...(force ? [
+      env.DB.prepare("DELETE FROM usage_entries WHERE entitlement_id IN (SELECT id FROM entitlements WHERE plan_id = ?)").bind(planId),
+      env.DB.prepare("DELETE FROM earnings_ledger WHERE order_id IN (SELECT id FROM orders WHERE plan_id = ?) OR entitlement_id IN (SELECT id FROM entitlements WHERE plan_id = ?)").bind(planId, planId),
+      env.DB.prepare("DELETE FROM wallet_ledger WHERE order_id IN (SELECT id FROM orders WHERE plan_id = ?)").bind(planId),
+      env.DB.prepare("DELETE FROM payment_events WHERE order_id IN (SELECT id FROM orders WHERE plan_id = ?)").bind(planId),
+      env.DB.prepare("UPDATE orders SET upgrade_from_entitlement_id = NULL WHERE upgrade_from_entitlement_id IN (SELECT id FROM entitlements WHERE plan_id = ?)").bind(planId),
+      env.DB.prepare("DELETE FROM entitlements WHERE plan_id = ?").bind(planId),
+      env.DB.prepare("DELETE FROM orders WHERE plan_id = ?").bind(planId),
+    ] : []),
+    env.DB.prepare("DELETE FROM plans WHERE id = ?").bind(planId),
+  ]);
+  return { deleted: true as const, dependencies };
+}
+
 function publicUser(user: Awaited<ReturnType<typeof loadUser>>) {
   if (!user) return null;
   return { id: user.id, email: user.email, roles: user.roles, status: user.status, inviterAdminId: user.inviterAdminId };
@@ -1165,18 +1215,13 @@ app.delete("/api/owner/plans/:id", async (c) => {
   assertMutation(c);
   await requireSiteMode(c, "plan");
   const planId = c.req.param("id");
-  const plan = await c.env.DB.prepare("SELECT id FROM plans WHERE id = ?").bind(planId).first();
+  const plan = await c.env.DB.prepare("SELECT id, name FROM plans WHERE id = ?").bind(planId).first<{ id: string; name: string }>();
   if (!plan) return c.json({ error: "套餐不存在" }, 404);
-  const references = await c.env.DB.prepare(
-    `SELECT (SELECT COUNT(*) FROM orders WHERE plan_id = ?) AS orders,
-      (SELECT COUNT(*) FROM entitlements WHERE plan_id = ?) AS entitlements`,
-  ).bind(planId, planId).first<{ orders: number; entitlements: number }>();
-  if (Number(references?.orders || 0) > 0 || Number(references?.entitlements || 0) > 0) {
-    return c.json({ error: "套餐已有订单或权益历史，不能删除；请改为归档" }, 409);
-  }
-  await c.env.DB.prepare("DELETE FROM plans WHERE id = ?").bind(planId).run();
-  await audit(c.env, c.get("user").id, "plan.delete", "plan", planId);
-  return c.json({ ok: true });
+  const force = c.req.query("force") === "true";
+  const result = await deletePlan(c.env, planId, force);
+  if (!result.deleted) return c.json({ error: "套餐已有订单或权益历史；如确认删除全部关联数据，请使用强制删除", requiresForce: true, dependencies: result.dependencies }, 409);
+  await audit(c.env, c.get("user").id, force ? "plan.force_delete" : "plan.delete", "plan", planId, { name: plan.name, force, removed: result.dependencies });
+  return c.json({ ok: true, force, removed: result.dependencies });
 });
 
 app.get("/api/owner/users", async (c) => {

@@ -33,6 +33,52 @@ function assertMutation(c: { req: { header(name: string): string | undefined }; 
   if (!originAllowed(c)) throw new Error("请求来源无效");
 }
 
+type NodeDeleteDependencies = {
+  planAssignments: number;
+  userAssignments: number;
+  installTokens: number;
+  reports: number;
+  usageEntries: number;
+  directUsageEntries: number;
+};
+
+async function nodeDeleteDependencies(env: Env, nodeId: string): Promise<NodeDeleteDependencies> {
+  const row = await env.DB.prepare(
+    `SELECT
+      (SELECT COUNT(*) FROM plan_nodes WHERE node_id = ?) AS plan_assignments,
+      (SELECT COUNT(*) FROM user_nodes WHERE node_id = ?) AS user_assignments,
+      (SELECT COUNT(*) FROM node_install_tokens WHERE node_id = ?) AS install_tokens,
+      (SELECT COUNT(*) FROM usage_reports WHERE node_id = ?) AS reports,
+      (SELECT COUNT(*) FROM usage_entries WHERE node_id = ?) AS usage_entries,
+      (SELECT COUNT(*) FROM direct_usage_entries WHERE node_id = ?) AS direct_usage_entries`,
+  ).bind(nodeId, nodeId, nodeId, nodeId, nodeId, nodeId).first<Record<string, number>>();
+  return {
+    planAssignments: Number(row?.plan_assignments || 0),
+    userAssignments: Number(row?.user_assignments || 0),
+    installTokens: Number(row?.install_tokens || 0),
+    reports: Number(row?.reports || 0),
+    usageEntries: Number(row?.usage_entries || 0),
+    directUsageEntries: Number(row?.direct_usage_entries || 0),
+  };
+}
+
+async function deleteNode(env: Env, nodeId: string, force: boolean) {
+  const dependencies = await nodeDeleteDependencies(env, nodeId);
+  if (!force && dependencies.usageEntries + dependencies.directUsageEntries > 0) return { deleted: false as const, dependencies };
+  await env.DB.batch([
+    ...(force ? [
+      env.DB.prepare("DELETE FROM usage_entries WHERE node_id = ?").bind(nodeId),
+      env.DB.prepare("DELETE FROM direct_usage_entries WHERE node_id = ?").bind(nodeId),
+    ] : []),
+    env.DB.prepare("DELETE FROM plan_nodes WHERE node_id = ?").bind(nodeId),
+    env.DB.prepare("DELETE FROM user_nodes WHERE node_id = ?").bind(nodeId),
+    env.DB.prepare("DELETE FROM node_install_tokens WHERE node_id = ?").bind(nodeId),
+    env.DB.prepare("DELETE FROM usage_reports WHERE node_id = ?").bind(nodeId),
+    env.DB.prepare("DELETE FROM nodes WHERE id = ?").bind(nodeId),
+  ]);
+  return { deleted: true as const, dependencies };
+}
+
 function publicUser(user: Awaited<ReturnType<typeof loadUser>>) {
   if (!user) return null;
   return { id: user.id, email: user.email, roles: user.roles, status: user.status, inviterAdminId: user.inviterAdminId };
@@ -796,6 +842,20 @@ app.patch("/api/admin/nodes/:id", async (c) => {
   return c.json({ ok: true, status: "pending" });
 });
 
+app.delete("/api/admin/nodes/:id", async (c) => {
+  assertMutation(c);
+  const user = c.get("user");
+  const id = c.req.param("id");
+  const node = await c.env.DB.prepare("SELECT id, name FROM nodes WHERE id = ? AND owner_admin_id = ?")
+    .bind(id, user.id).first<{ id: string; name: string }>();
+  if (!node) return c.json({ error: "节点不存在" }, 404);
+  const force = c.req.query("force") === "true";
+  const result = await deleteNode(c.env, id, force);
+  if (!result.deleted) return c.json({ error: "节点已有用量历史；如确认不再保留这些记录，请使用强制删除", requiresForce: true, dependencies: result.dependencies }, 409);
+  await audit(c.env, user.id, force ? "node.force_delete" : "node.delete", "node", id, { name: node.name, force, removed: result.dependencies });
+  return c.json({ ok: true, force, removed: result.dependencies });
+});
+
 app.post("/api/admin/nodes/:id/rotate-token", async (c) => {
   assertMutation(c);
   const user = c.get("user");
@@ -985,17 +1045,11 @@ app.delete("/api/owner/nodes/:id", async (c) => {
   const id = c.req.param("id");
   const node = await c.env.DB.prepare("SELECT id, name FROM nodes WHERE id = ?").bind(id).first<{ id: string; name: string }>();
   if (!node) return c.json({ error: "节点不存在" }, 404);
-  const history = await c.env.DB.prepare("SELECT 1 FROM usage_entries WHERE node_id = ? UNION SELECT 1 FROM direct_usage_entries WHERE node_id = ? LIMIT 1").bind(id, id).first();
-  if (history) return c.json({ error: "节点已有用量记录，不能删除；可改为归档以保留账务历史" }, 400);
-  await c.env.DB.batch([
-    c.env.DB.prepare("DELETE FROM plan_nodes WHERE node_id = ?").bind(id),
-    c.env.DB.prepare("DELETE FROM user_nodes WHERE node_id = ?").bind(id),
-    c.env.DB.prepare("DELETE FROM node_install_tokens WHERE node_id = ?").bind(id),
-    c.env.DB.prepare("DELETE FROM usage_reports WHERE node_id = ?").bind(id),
-    c.env.DB.prepare("DELETE FROM nodes WHERE id = ?").bind(id),
-  ]);
-  await audit(c.env, c.get("user").id, "node.delete", "node", id, { name: node.name });
-  return c.json({ ok: true });
+  const force = c.req.query("force") === "true";
+  const result = await deleteNode(c.env, id, force);
+  if (!result.deleted) return c.json({ error: "节点已有用量历史；如确认不再保留这些记录，请使用强制删除", requiresForce: true, dependencies: result.dependencies }, 409);
+  await audit(c.env, c.get("user").id, force ? "node.force_delete" : "node.delete", "node", id, { name: node.name, force, removed: result.dependencies });
+  return c.json({ ok: true, force, removed: result.dependencies });
 });
 
 app.post("/api/owner/nodes/:id/rotate-token", async (c) => {

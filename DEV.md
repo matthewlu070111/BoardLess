@@ -388,6 +388,7 @@ POST /api/app/subscription/rotate
 | `GET` | `/api/admin/nodes` | 自有节点列表 |
 | `POST` | `/api/admin/nodes` | `{ name, protocol, config }` |
 | `PATCH` | `/api/admin/nodes/:id` | `{ name?, config?, archive? }` |
+| `DELETE` | `/api/admin/nodes/:id` | 删除自有节点；`?force=true` 可连同历史用量明细强制删除 |
 | `POST` | `/api/admin/nodes/:id/rotate-token` | 轮换节点令牌 |
 | `GET` | `/api/admin/invitations` | 最近 100 条邀请 |
 | `POST` | `/api/admin/invitations` | `{ expiresHours? }`，邀请用户 |
@@ -469,6 +470,7 @@ POST /api/admin/withdrawals
 | `GET` | `/api/owner/nodes` | 全站节点列表 |
 | `POST` | `/api/owner/nodes` | 创建站长自有节点 |
 | `PATCH` | `/api/owner/nodes/:id` | 编辑或归档站长自有节点 |
+| `DELETE` | `/api/owner/nodes/:id` | 删除任意节点；`?force=true` 可连同历史用量明细强制删除 |
 | `POST` | `/api/owner/nodes/:id/rotate-token` | 轮换站长自有节点令牌 |
 | `POST` | `/api/owner/nodes/:id/action` | `{ action: "approve" | "suspend" }` |
 | `GET` | `/api/owner/plans` | 全部套餐 |
@@ -483,6 +485,8 @@ POST /api/admin/withdrawals
 | `GET` | `/api/owner/audit` | 最近 500 条审计日志 |
 
 站长创建的节点直接为 `approved`。但站长只能编辑、归档和轮换自己创建的节点；可通过 `action` 接口审核或停用任意节点。
+
+普通删除会移除节点的套餐关系、用户授权、安装令牌和上报去重记录；如节点已有用量历史，接口返回 `409`、`requiresForce: true` 及关联数量。只有用户明确确认后才应改用 `?force=true`。强制删除还会清除该节点的套餐模式与逐节点模式用量明细，影响后续用量和收益统计，但不会自动回滚已经写入的收益账本。
 
 ### 创建套餐
 

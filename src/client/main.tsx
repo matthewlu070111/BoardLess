@@ -262,14 +262,35 @@ function AdminDashboard() {
   return <Page title="管理员概览" description={siteMode === "plan" ? "你的节点、用户与可提现收益" : "逐节点授权站点中的节点和用户"}><div className={`stat-grid ${siteMode === "plan" ? "four" : ""}`}><Stat label="节点" value={String(data.nodeCount)} hint="仅你可以维护配置" /><Stat label="邀请用户" value={String(data.invitedUsers)} hint="归属关系固定" />{siteMode === "plan" && <><Stat label="可提现" value={money(data.availableCents)} hint="最低 ¥100" /><Stat label="待处理提现" value={String(data.pendingWithdrawals)} hint="由站长人工核销" /></>}</div><section className="panel"><h2>节点接入流程</h2><div className="steps"><span><b>1</b> 选择站长启用的节点后端</span><span><b>2</b> 按后端提供的表单完成配置</span><span><b>3</b> 在服务器执行一次性安装命令</span><span><b>4</b> 等待站长审核{siteMode === "plan" ? "并加入套餐" : "并由站长分配给用户"}</span></div></section></Page>;
 }
 
+function NodeDeleteDialog({ node, busy, error, onClose, onDelete }: { node: Json | null; busy: boolean; error: string; onClose(): void; onDelete(force: boolean): void }) {
+  const [force, setForce] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
+  useEffect(() => { setForce(false); setConfirmation(""); }, [node?.id]);
+  if (!node) return null;
+  const forceConfirmed = confirmation === node.name;
+  return <div className="modal-layer" role="presentation"><form className="modal delete-modal" role="dialog" aria-modal="true" aria-labelledby="delete-node-title" onSubmit={(event) => { event.preventDefault(); onDelete(force); }}>
+    <button type="button" className="modal-close" aria-label="关闭" disabled={busy} onClick={onClose}>×</button>
+    <div className="delete-modal-icon">!</div><p className="eyebrow">不可撤销操作</p><h2 id="delete-node-title">删除节点“{node.name}”</h2>
+    <div className="delete-node-summary"><strong>{node.name}</strong><span>{String(node.protocol).toUpperCase()}{node.config?.server ? ` · ${node.config.server}:${node.config.port}` : ""}</span></div>
+    <ul className="delete-impact"><li>节点令牌将立即失效，节点会从套餐和用户授权中移除</li><li>安装令牌及上报去重记录会一并删除</li><li>普通删除遇到历史用量时会停止，不会破坏账务依据</li></ul>
+    <label className={`force-delete-option ${force ? "selected" : ""}`}><input type="checkbox" checked={force} disabled={busy} onChange={(event) => setForce(event.target.checked)} /><span><strong>强制删除</strong><small>同时删除该节点的历史用量明细，会影响后续用量与收益统计；已写入账本的记录不会自动回滚。</small></span></label>
+    {force && <Field label={`输入节点名称“${node.name}”以确认`} hint="名称必须完全一致"><input autoFocus value={confirmation} disabled={busy} autoComplete="off" onChange={(event) => setConfirmation(event.target.value)} /></Field>}
+    {error && <Notice tone="danger">{error}</Notice>}
+    <div className="modal-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>取消</button><button className="button danger" disabled={busy || (force && !forceConfirmed)}>{busy ? "正在删除…" : force ? "强制删除节点" : "删除节点"}</button></div>
+  </form></div>;
+}
+
 function AdminNodes() {
   const [nodes, setNodes] = useState<Json[] | null>(null); const [token, setToken] = useState("");
+  const [deleting, setDeleting] = useState<Json | null>(null); const [deleteError, setDeleteError] = useState(""); const [deleteBusy, setDeleteBusy] = useState(false);
   const load = () => api<{ nodes: Json[] }>("/api/admin/nodes").then((r) => setNodes(r.nodes)); useEffect(() => { void load(); }, []);
   const rotate = async (id: string) => { if (!confirm("旧令牌会立即失效，继续吗？")) return; const result = await api<Json>(`/api/admin/nodes/${id}/rotate-token`, { method: "POST", body: "{}" }); setToken(result.token); };
+  const remove = async (force: boolean) => { if (!deleting) return; setDeleteBusy(true); setDeleteError(""); try { await api(`/api/admin/nodes/${deleting.id}${force ? "?force=true" : ""}`, { method: "DELETE", body: "{}" }); setDeleting(null); await load(); } catch (reason) { setDeleteError(reason instanceof Error ? reason.message : "删除失败"); } finally { setDeleteBusy(false); } };
   if (!nodes) return <Loading />;
   return <Page title="我的节点" description="新增节点的后端、协议和配置项均由站长启用的后端仓库提供" action={<Link className="button primary" to="/admin/deploy">＋ 新增节点</Link>}>
     {token && <Notice tone="success"><strong>请立即保存节点令牌：</strong><code className="token">{token}</code><button className="link-button" onClick={() => navigator.clipboard.writeText(token)}>复制</button>。关闭后无法再次查看。</Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>协议</th><th>状态</th><th>在线</th><th>最后心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => <tr key={node.id}><td><strong>{node.name}</strong><small className="cell-sub">{node.config.server}:{node.config.port}</small></td><td className="upper">{node.protocol}</td><td><Badge value={node.status} /></td><td>{node.online_count}</td><td>{date(node.last_seen_at)}</td><td><button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button></td></tr>)}</tbody></table>{!nodes.length && <Empty>还没有节点</Empty>}</section>
+    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>协议</th><th>状态</th><th>在线</th><th>最后心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => <tr key={node.id}><td><strong>{node.name}</strong><small className="cell-sub">{node.config.server}:{node.config.port}</small></td><td className="upper">{node.protocol}</td><td><Badge value={node.status} /></td><td>{node.online_count}</td><td>{date(node.last_seen_at)}</td><td className="actions"><button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button><button className="link-button negative" onClick={() => { setDeleteError(""); setDeleting(node); }}>删除</button></td></tr>)}</tbody></table>{!nodes.length && <Empty>还没有节点</Empty>}</section>
+    <NodeDeleteDialog node={deleting} busy={deleteBusy} error={deleteError} onClose={() => { if (!deleteBusy) setDeleting(null); }} onDelete={remove} />
   </Page>;
 }
 
@@ -355,15 +376,17 @@ function OwnerDashboard() {
 function OwnerNodes() {
   const { user } = useAuth();
   const [nodes, setNodes] = useState<Json[] | null>(null); const [token, setToken] = useState("");
+  const [deleting, setDeleting] = useState<Json | null>(null); const [deleteError, setDeleteError] = useState(""); const [deleteBusy, setDeleteBusy] = useState(false);
   const load = () => api<{ nodes: Json[] }>("/api/owner/nodes").then((r) => setNodes(r.nodes)); useEffect(() => { void load(); }, []);
   const action = async (id: string, value: "approve" | "suspend") => { await api(`/api/owner/nodes/${id}/action`, { method: "POST", body: JSON.stringify({ action: value }) }); await load(); };
   const rotate = async (id: string) => { if (!confirm("旧令牌会立即失效，继续吗？")) return; const result = await api<Json>(`/api/owner/nodes/${id}/rotate-token`, { method: "POST", body: "{}" }); setToken(result.token); };
   const archive = async (id: string) => { if (!confirm("归档后节点将从订阅和套餐中停止使用，继续吗？")) return; await api(`/api/owner/nodes/${id}`, { method: "PATCH", body: JSON.stringify({ archive: true }) }); await load(); };
-  const remove = async (id: string) => { if (!confirm("将永久删除此节点及其套餐/用户分配关系。已有用量历史的节点不能删除，继续吗？")) return; await api(`/api/owner/nodes/${id}`, { method: "DELETE", body: "{}" }); await load(); };
+  const remove = async (force: boolean) => { if (!deleting) return; setDeleteBusy(true); setDeleteError(""); try { await api(`/api/owner/nodes/${deleting.id}${force ? "?force=true" : ""}`, { method: "DELETE", body: "{}" }); setDeleting(null); await load(); } catch (reason) { setDeleteError(reason instanceof Error ? reason.message : "删除失败"); } finally { setDeleteBusy(false); } };
   if (!nodes) return <Loading />;
   return <Page title="节点管理" description="新增节点的后端、协议和配置项均由已启用的后端仓库提供" action={<Link className="button primary" to="/owner/deploy">＋ 新增节点</Link>}>
     {token && <Notice tone="success"><strong>请立即保存节点令牌：</strong><code className="token">{token}</code><button className="link-button" onClick={() => navigator.clipboard.writeText(token)}>复制</button>。关闭后无法再次查看。</Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>归属</th><th>协议</th><th>地址</th><th>状态</th><th>心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => { const own = node.owner_admin_id === user?.id; return <tr key={node.id}><td><strong>{node.name}</strong></td><td>{own ? "站长自营" : node.owner_email}</td><td className="upper">{node.protocol}</td><td className="mono">{node.config.server}:{node.config.port}</td><td><Badge value={node.status} /></td><td>{date(node.last_seen_at)}</td><td className="actions">{own ? <>{node.status === "pending" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status !== "archived" && <button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button>}{node.status !== "archived" && <button className="link-button negative" onClick={() => archive(node.id)}>归档</button>}</> : <>{node.status !== "approved" && node.status !== "archived" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status === "approved" && <button className="link-button negative" onClick={() => action(node.id, "suspend")}>停用</button>}</>}<button className="link-button negative" onClick={() => remove(node.id)}>删除</button></td></tr>; })}</tbody></table>{!nodes.length && <Empty>暂无节点</Empty>}</section>
+    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>归属</th><th>协议</th><th>地址</th><th>状态</th><th>心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => { const own = node.owner_admin_id === user?.id; return <tr key={node.id}><td><strong>{node.name}</strong></td><td>{own ? "站长自营" : node.owner_email}</td><td className="upper">{node.protocol}</td><td className="mono">{node.config.server}:{node.config.port}</td><td><Badge value={node.status} /></td><td>{date(node.last_seen_at)}</td><td className="actions">{own ? <>{node.status === "pending" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status !== "archived" && <button className="link-button" onClick={() => rotate(node.id)}>轮换令牌</button>}{node.status !== "archived" && <button className="link-button negative" onClick={() => archive(node.id)}>归档</button>}</> : <>{node.status !== "approved" && node.status !== "archived" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status === "approved" && <button className="link-button negative" onClick={() => action(node.id, "suspend")}>停用</button>}</>}<button className="link-button negative" onClick={() => { setDeleteError(""); setDeleting(node); }}>删除</button></td></tr>; })}</tbody></table>{!nodes.length && <Empty>暂无节点</Empty>}</section>
+    <NodeDeleteDialog node={deleting} busy={deleteBusy} error={deleteError} onClose={() => { if (!deleteBusy) setDeleting(null); }} onDelete={remove} />
   </Page>;
 }
 

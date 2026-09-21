@@ -789,6 +789,7 @@ https://github.com/<OWNER>/<BACKEND_REPO>
   "name": "Example BoardLess Agent",
   "version": "1.0.0",
   "panelApiVersion": "v1",
+  "capabilities": ["nodeTrafficLimit"],
   "install": {
     "script": "scripts/install.sh",
     "sha256": "replace-with-64-character-sha256",
@@ -842,6 +843,7 @@ https://github.com/<OWNER>/<BACKEND_REPO>
 | `schemaVersion` | 识别块结构版本，当前规划为 `1` |
 | `backendId` | 后端永久唯一 ID，发布后不可随意更换 |
 | `panelApiVersion` | 该后端支持的 BoardLess 节点 API 版本 |
+| `capabilities` | 必填能力数组；当前必须包含且只支持 `nodeTrafficLimit` |
 | `install.script` | 仓库内节点安装脚本的相对路径 |
 | `install.sha256` | 对应提交中安装脚本的 SHA-256 |
 | `presets` | 后端官方维护的节点配置范例 |
@@ -849,6 +851,8 @@ https://github.com/<OWNER>/<BACKEND_REPO>
 | `generatedOutputs` | 安装时在节点服务器生成并回传的公开字段 |
 
 `inputs[].type` 目前支持 `text`、`hostname`、`email`、`number`、`url`、`password`、`select` 和 `checkbox`。`select` 必须提供 `{ "value", "label" }` 组成的 `options`。字段默认必填，只有明确声明 `required: false` 才可为空；`when: { "key": "enableFeature", "equals": "true" }` 可让字段仅在另一个字段取指定值时显示并生效。
+
+`nodeTrafficLimit` 不是可选提示，而是 BoardLess Schema v1 的强制能力。缺少 `capabilities`、传入空数组或未包含 `nodeTrafficLimit` 的后端会在导入/同步阶段被拒绝，不能进入确认或启用流程。声明该能力表示此后端创建的节点接受 BoardLess 按节点下发空用户快照来动态停止服务；Agent 不得因为节点仍为 `approved` 而继续沿用旧用户。
 
 需要传给安装脚本的字段应声明唯一的 `installArg`，其格式必须为 `--lowercase-kebab-case`；BoardLess 会逐项进行 Shell 引号处理。复选框可以通过 `checkedValue` 和 `uncheckedValue` 把布尔状态映射为脚本值，例如把勾选状态映射成 `--mode both`、未勾选映射成 `--mode boardless`。`password` 会自动视为敏感字段，也可显式设置 `sensitive: true`；敏感值只参与当次安装命令，不写入 BoardLess 的节点配置或安装令牌记录。带 `when` 的条件字段和敏感字段属于安装专用输入，不能被节点 `config` 模板引用。
 
@@ -861,7 +865,7 @@ https://github.com/<OWNER>/<BACKEND_REPO>
 README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 GitHub 内容：
 
 1. 只解析 `boardless:backend:start` 和 `boardless:backend:end` 之间的 `boardless-backend` JSON
-2. 特征码、`recognitionCode`、`backendId`、Schema 和 API 版本必须全部匹配
+2. 特征码、`recognitionCode`、`backendId`、Schema、API 版本和强制 `nodeTrafficLimit` 能力必须全部匹配
 3. 仓库 URL、README URL、安装脚本 URL 必须指向同一 GitHub 仓库
 4. README 和安装脚本必须固定到同一个提交 SHA
 5. 所有相对路径规范化后不得逃出仓库，禁止 `../` 和外部 URL
@@ -886,6 +890,7 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 | `PATCH` | `/api/owner/backends/:id` | 启用或停用已确认后端；切换 ref 使用同步接口 |
 | `GET` | `/api/deploy/presets` | 管理员或站长读取已启用后端的配置预设和表单字段 |
 | `POST` | `/api/deploy/nodes` | 管理员或站长根据后端预设和输入创建待安装节点 |
+| `PUT` | `/api/deploy/nodes/:id/traffic` | 节点所有者修改总额度、重置日和计费方向；不改变审核状态或历史流量 |
 | `POST` | `/api/deploy/nodes/:id/install-command` | 为自己创建的待安装节点生成短期有效的一次性安装命令 |
 | `POST` | `/api/node/v1/bootstrap` | Agent 首次启动时兑换安装令牌并提交公开配置 |
 
@@ -915,14 +920,31 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
   "inputs": {
     "server": "hk.example.com",
     "sni": "www.example.com"
+  },
+  "traffic": {
+    "limitBytes": 1099511627776,
+    "resetDay": 1,
+    "direction": "both"
   }
 }
 ```
 
+`traffic` 对所有新节点都是必填对象，不能因为后端已经声明 capability 而省略。字段规则：
+
+| 字段 | 规则 |
+| --- | --- |
+| `limitBytes` | 大于 0 的安全整数，单位为字节；后台输入 GB 时按 `1024³` 换算 |
+| `resetDay` | `1`–`31`；短月中的 29–31 日按当月最后一天处理 |
+| `direction` | `up`、`down` 或 `both`；`both` 为原始上下行之和 |
+
+旧节点的数据库字段可以为 `NULL`，用于兼容升级前数据，含义为不限量；这不放宽新节点创建规则。所有者可随后通过 `PUT /api/deploy/nodes/:id/traffic` 补填或修改，服务端会立即使用已有 `usage_entries` 与 `direct_usage_entries` 重新计算本周期用量。
+
+周期使用 `Asia/Shanghai` 时区，在指定日 00:00 重置。计费用量满足 `usedBytes >= limitBytes` 时节点耗尽，但状态仍保持 `approved`：`/api/node/v1/config` 返回空 `users`，用户订阅排除该节点；跨入下一周期后无需人工操作即可恢复。节点耗尽后仍允许 Agent 上报切换前已经产生的最后一批流量增量。
+
 配置流程：
 
 1. BoardLess 先展示已启用后端，再展示所选后端的配置方案
-2. BoardLess 严格按 README 中已校验的 `inputs` 生成表单，不在前端硬编码协议字段
+2. BoardLess 严格按 README 中已校验的 `inputs` 生成后端表单，并固定要求节点流量额度、重置日和计费方向
 3. 服务端合并预设和管理员输入，浏览器不能自行生成最终配置
 4. 没有 `generatedOutputs` 时直接执行现有 `validateNodeConfig`
 5. 存在安装阶段输出时，先校验已知字段并保持节点为 `pending`
@@ -1103,6 +1125,7 @@ bash scripts/deploy-cloudflare.sh \
 
 - `BOARDLESS_BACKEND_REPOSITORY_V1` 固定特征识别码
 - 唯一 `backendId` 和 `boardless-backend` JSON 识别块
+- 必填的 `"capabilities": ["nodeTrafficLimit"]`
 - 支持的操作系统和 CPU 架构
 - Agent、代理程序与 BoardLess API 的版本兼容性
 - 一个或多个配置预设及其输入、生成输出

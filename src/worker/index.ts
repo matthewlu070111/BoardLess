@@ -9,7 +9,7 @@ import { closeEntitlement, proratedCredit, settleExpiredEntitlements, settleNode
 import { createAlipayQr, openPaymentSecrets, queryAlipayOrder, resolveAlipayConfig, sealPaymentSecrets, verifyAlipayNotification } from "./payment";
 import { renderSubscription, validateNodeConfig } from "./protocols";
 import type { AppVariables, Env, NodeRow, PlanRow, Protocol, Role } from "./types";
-import { importBackendRepository, renderPresetConfig, type BackendInput, type BackendPreset, type ImportedBackend } from "./backends";
+import { importBackendRepository, renderPresetConfig, type BackendCapability, type BackendInput, type BackendPreset, type ImportedBackend } from "./backends";
 
 type App = { Bindings: Env; Variables: AppVariables };
 export const app = new Hono<App>();
@@ -162,6 +162,9 @@ interface DirectGrantRow {
   node_status?: string;
   node_owner_status?: string;
   node_owner_disabled_at?: number | null;
+  traffic_limit_bytes: number | null;
+  traffic_reset_day: number | null;
+  traffic_direction: "up" | "down" | "both" | null;
   user_status?: string;
   access_uuid?: string;
   access_secret?: string;
@@ -174,6 +177,7 @@ async function directGrants(env: Env, filters: { userId?: string; nodeId?: strin
   if (filters.nodeId) { clauses.push("un.node_id = ?"); bindings.push(filters.nodeId); }
   const rows = await env.DB.prepare(
     `SELECT un.*, n.name AS node_name, n.protocol, n.status AS node_status,
+      n.traffic_limit_bytes, n.traffic_reset_day, n.traffic_direction,
       owner.status AS node_owner_status, ap.disabled_at AS node_owner_disabled_at,
       granted.status AS user_status, granted.access_uuid, granted.access_secret,
       COALESCE((SELECT SUM(d.charged_up_bytes + d.charged_down_bytes) FROM direct_usage_entries d
@@ -295,11 +299,13 @@ app.get("/api/app/dashboard", async (c) => {
     .bind(user.id).first<{ count: number }>();
   if (mode === "direct") {
     const grants = await directGrants(c.env, { userId: user.id });
-    return c.json({ siteMode: mode, grants: grants.map((grant) => ({
+    return c.json({ siteMode: mode, grants: await Promise.all(grants.map(async (grant) => ({
       nodeId: grant.node_id, name: grant.node_name, protocol: grant.protocol, multiplier: grant.multiplier_bps / 10000,
       expiresAt: grant.expires_at, quotaBytes: grant.quota_bytes, quotaCycle: grant.quota_cycle,
-      usedBytes: Number(grant.used_bytes), active: directGrantActive(grant, timestamp),
-    })), orderCount: orderCount?.count || 0 });
+      usedBytes: Number(grant.used_bytes), active: directGrantActive(grant, timestamp) && await trafficAvailable(c.env, {
+        id: grant.node_id, traffic_limit_bytes: grant.traffic_limit_bytes, traffic_reset_day: grant.traffic_reset_day, traffic_direction: grant.traffic_direction,
+      }, timestamp),
+    }))), orderCount: orderCount?.count || 0 });
   }
   const entitlement = await c.env.DB.prepare(
     `SELECT e.*, p.name AS plan_name FROM entitlements e JOIN plans p ON p.id = e.plan_id
@@ -345,9 +351,21 @@ app.get("/api/app/usage", async (c) => {
 app.get("/api/app/subscription", async (c) => {
   const user = c.get("user");
   const mode = await siteMode(c.env);
+  const timestamp = now();
+  const entitlement = mode === "plan" ? await c.env.DB.prepare(
+    "SELECT plan_id FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? LIMIT 1",
+  ).bind(user.id, timestamp, timestamp).first<{ plan_id: string }>() : null;
+  const candidates = entitlement ? await c.env.DB.prepare(
+    `SELECT n.* FROM nodes n JOIN plan_nodes pn ON pn.node_id = n.id
+     JOIN users owner ON owner.id = n.owner_admin_id LEFT JOIN admin_profiles ap ON ap.user_id = n.owner_admin_id
+     WHERE pn.plan_id = ? AND n.status = 'approved' AND owner.status = 'active' AND ap.disabled_at IS NULL`,
+  ).bind(entitlement.plan_id).all<NodeRow>() : { results: [] as NodeRow[] };
+  const grants = mode === "direct" ? await directGrants(c.env, { userId: user.id }) : [];
   const active = mode === "plan"
-    ? await c.env.DB.prepare("SELECT 1 FROM entitlements WHERE user_id = ? AND status = 'active' AND starts_at <= ? AND ends_at > ? LIMIT 1").bind(user.id, now(), now()).first()
-    : (await directGrants(c.env, { userId: user.id })).some((grant) => directGrantActive(grant));
+    ? (await Promise.all(candidates.results.map((node) => trafficAvailable(c.env, node, timestamp)))).some(Boolean)
+    : (await Promise.all(grants.map(async (grant) => directGrantActive(grant, timestamp) && await trafficAvailable(c.env, {
+      id: grant.node_id, traffic_limit_bytes: grant.traffic_limit_bytes, traffic_reset_day: grant.traffic_reset_day, traffic_direction: grant.traffic_direction,
+    }, timestamp)))).some(Boolean);
   const token = await signSubscriptionToken(c.env.SESSION_SECRET, user.id, user.subscriptionVersion);
   return c.json({ active: Boolean(active), siteMode: mode, baseUrl: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/sub/${token}`, targets: ["clash", "shadowrocket", "singbox", "surge"] });
 });
@@ -599,6 +617,74 @@ function parseStringArray(value: string): string[] {
   } catch { return []; }
 }
 
+function parseBackendCapabilities(value: string): BackendCapability[] {
+  try {
+    const parsed = JSON.parse(value) as { capabilities?: unknown };
+    return Array.isArray(parsed.capabilities) ? parsed.capabilities.filter((item): item is BackendCapability => item === "nodeTrafficLimit") : [];
+  } catch { return []; }
+}
+
+type NodeTrafficInput = { limitBytes: number; resetDay: number; direction: "up" | "down" | "both" };
+type NodeTrafficStatus = NodeTrafficInput & { upBytes: number; downBytes: number; usedBytes: number; cycleStart: number; nextResetAt: number; available: boolean };
+
+function normalizeNodeTraffic(value: unknown): NodeTrafficInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("节点流量额度不能为空");
+  const input = value as Record<string, unknown>;
+  const limitBytes = Math.floor(Number(input.limitBytes));
+  const resetDay = Math.floor(Number(input.resetDay));
+  const direction = input.direction;
+  if (!Number.isSafeInteger(limitBytes) || limitBytes <= 0) throw new Error("节点总流量无效");
+  if (!Number.isSafeInteger(resetDay) || resetDay < 1 || resetDay > 31) throw new Error("节点流量重置日必须为 1-31");
+  if (direction !== "up" && direction !== "down" && direction !== "both") throw new Error("节点流量计费方向无效");
+  return { limitBytes, resetDay, direction };
+}
+
+function trafficBoundary(year: number, month: number, resetDay: number): number {
+  const normalized = new Date(Date.UTC(year, month - 1, 1));
+  const normalizedYear = normalized.getUTCFullYear();
+  const normalizedMonth = normalized.getUTCMonth() + 1;
+  const lastDay = new Date(Date.UTC(normalizedYear, normalizedMonth, 0)).getUTCDate();
+  const day = Math.min(resetDay, lastDay);
+  return Math.floor(Date.parse(`${normalizedYear}-${String(normalizedMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}T00:00:00+08:00`) / 1000);
+}
+
+export function nodeTrafficCycle(timestamp: number, resetDay: number): { start: number; next: number } {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "numeric" }).formatToParts(new Date(timestamp * 1000));
+  const year = Number(parts.find((part) => part.type === "year")?.value);
+  const month = Number(parts.find((part) => part.type === "month")?.value);
+  const current = trafficBoundary(year, month, resetDay);
+  return timestamp >= current
+    ? { start: current, next: trafficBoundary(year, month + 1, resetDay) }
+    : { start: trafficBoundary(year, month - 1, resetDay), next: current };
+}
+
+async function nodeTrafficStatus(env: Env, node: Pick<NodeRow, "id" | "traffic_limit_bytes" | "traffic_reset_day" | "traffic_direction">, timestamp = now()): Promise<NodeTrafficStatus | null> {
+  if (!node.traffic_limit_bytes || !node.traffic_reset_day || !node.traffic_direction) return null;
+  const cycle = nodeTrafficCycle(timestamp, node.traffic_reset_day);
+  const usage = await env.DB.prepare(
+    `SELECT COALESCE(SUM(up_bytes), 0) AS up_bytes, COALESCE(SUM(down_bytes), 0) AS down_bytes FROM (
+       SELECT up_bytes, down_bytes FROM usage_entries WHERE node_id = ? AND observed_at >= ?
+       UNION ALL
+       SELECT up_bytes, down_bytes FROM direct_usage_entries WHERE node_id = ? AND observed_at >= ?
+     )`,
+  ).bind(node.id, cycle.start, node.id, cycle.start).first<{ up_bytes: number; down_bytes: number }>();
+  const upBytes = Number(usage?.up_bytes || 0);
+  const downBytes = Number(usage?.down_bytes || 0);
+  const usedBytes = node.traffic_direction === "up" ? upBytes : node.traffic_direction === "down" ? downBytes : upBytes + downBytes;
+  return {
+    limitBytes: node.traffic_limit_bytes, resetDay: node.traffic_reset_day, direction: node.traffic_direction,
+    upBytes, downBytes, usedBytes, cycleStart: cycle.start, nextResetAt: cycle.next, available: usedBytes < node.traffic_limit_bytes,
+  };
+}
+
+async function nodesWithTraffic<T extends NodeRow>(env: Env, nodes: T[], timestamp = now()) {
+  return Promise.all(nodes.map(async (node) => ({ ...node, traffic: await nodeTrafficStatus(env, node, timestamp) })));
+}
+
+async function trafficAvailable(env: Env, node: Pick<NodeRow, "id" | "traffic_limit_bytes" | "traffic_reset_day" | "traffic_direction">, timestamp = now()) {
+  return (await nodeTrafficStatus(env, node, timestamp))?.available !== false;
+}
+
 function parseBackendInputs(value: string): BackendInput[] {
   try {
     const parsed = JSON.parse(value) as unknown;
@@ -653,6 +739,7 @@ app.post("/api/owner/backends/import", async (c) => {
       repositoryUrl: imported.repositoryUrl, requestedRef: imported.requestedRef, commitSha: imported.commitSha,
       readmeHash: imported.readmeHash, installScript: imported.manifest.install.script,
       installSha256: imported.manifest.install.sha256,
+      capabilities: imported.manifest.capabilities,
       presets: imported.manifest.presets.map(({ id, name, protocol, description, inputs, generatedOutputs }) => ({ id, name, protocol, description, inputs, generatedOutputs })),
     },
   }, 201);
@@ -694,7 +781,7 @@ async function listNodePresets(c: Context<App>) {
   const user = c.get("user");
   if (user.roles.includes("admin")) await ensureActiveAdmin(c.env, user.id);
   const rows = await c.env.DB.prepare(
-    `SELECT p.*, b.backend_id, b.name AS backend_name, b.version AS backend_version, b.commit_sha
+    `SELECT p.*, b.backend_id, b.name AS backend_name, b.version AS backend_version, b.commit_sha, b.manifest_json
      FROM backend_presets p JOIN backend_repositories b ON b.id = p.backend_repository_id
      WHERE b.status = 'enabled' ORDER BY b.name, p.name`,
   ).all<Record<string, unknown>>();
@@ -704,7 +791,8 @@ async function listNodePresets(c: Context<App>) {
     inputs: parseBackendInputs(String(row.required_inputs_json)),
     requiredInputs: parseBackendInputs(String(row.required_inputs_json)).map((input) => input.key),
     generatedOutputs: parseStringArray(String(row.generated_outputs_json)),
-    config_json: undefined, required_inputs_json: undefined, generated_outputs_json: undefined,
+    capabilities: parseBackendCapabilities(String(row.manifest_json)),
+    config_json: undefined, required_inputs_json: undefined, generated_outputs_json: undefined, manifest_json: undefined,
   })) });
 }
 
@@ -712,14 +800,16 @@ async function createNodeFromPreset(c: Context<App>) {
   assertMutation(c);
   const user = c.get("user");
   if (user.roles.includes("admin")) await ensureActiveAdmin(c.env, user.id);
-  const input = await body<{ backendId: string; presetId: string; name: string; inputs: Record<string, unknown> }>(c);
+  const input = await body<{ backendId: string; presetId: string; name: string; inputs: Record<string, unknown>; traffic?: unknown }>(c);
   if (!input.name?.trim() || input.name.length > 80) return c.json({ error: "节点名称不能为空且最多 80 字" }, 400);
   const row = await c.env.DB.prepare(
-    `SELECT p.*, b.id AS backend_repository_id, b.backend_id
+    `SELECT p.*, b.id AS backend_repository_id, b.backend_id, b.manifest_json
      FROM backend_presets p JOIN backend_repositories b ON b.id = p.backend_repository_id
      WHERE b.backend_id = ? AND p.preset_id = ? AND b.status = 'enabled'`,
   ).bind(String(input.backendId || ""), String(input.presetId || "")).first<Record<string, unknown>>();
   if (!row) return c.json({ error: "后端预设不存在或尚未启用" }, 404);
+  if (!parseBackendCapabilities(String(row.manifest_json)).includes("nodeTrafficLimit")) throw new Error("节点后端缺少 nodeTrafficLimit 能力");
+  const traffic = normalizeNodeTraffic(input.traffic);
   const inputDefinitions = parseBackendInputs(String(row.required_inputs_json));
   const values = normalizeBackendInputs(inputDefinitions, input.inputs);
   const generatedOutputs = parseStringArray(String(row.generated_outputs_json));
@@ -730,11 +820,13 @@ async function createNodeFromPreset(c: Context<App>) {
   const storedValues = Object.fromEntries(Object.entries(values).map(([key, value]) => [key, inputDefinitions.find((field) => field.key === key)?.sensitive ? "" : value]));
   await c.env.DB.prepare(
     `INSERT INTO nodes
-     (id, owner_admin_id, name, protocol, status, config_json, token_hash, created_at, updated_at, backend_repository_id, backend_preset_id, backend_inputs_json)
-     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(id, user.id, input.name.trim(), row.protocol, JSON.stringify(config), await sha256(randomToken(32)), now(), now(), row.backend_repository_id, row.preset_id, JSON.stringify(storedValues)).run();
-  await audit(c.env, user.id, "node.create.from_preset", "node", id, { backendId: row.backend_id, presetId: row.preset_id });
-  return c.json({ node: { id, name: input.name.trim(), protocol: row.protocol, status: "pending", config }, generatedOutputs }, 201);
+     (id, owner_admin_id, name, protocol, status, config_json, token_hash, created_at, updated_at, backend_repository_id, backend_preset_id, backend_inputs_json,
+      traffic_limit_bytes, traffic_reset_day, traffic_direction)
+     VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, user.id, input.name.trim(), row.protocol, JSON.stringify(config), await sha256(randomToken(32)), now(), now(), row.backend_repository_id, row.preset_id,
+    JSON.stringify(storedValues), traffic?.limitBytes ?? null, traffic?.resetDay ?? null, traffic?.direction ?? null).run();
+  await audit(c.env, user.id, "node.create.from_preset", "node", id, { backendId: row.backend_id, presetId: row.preset_id, traffic });
+  return c.json({ node: { id, name: input.name.trim(), protocol: row.protocol, status: "pending", config, traffic }, generatedOutputs }, 201);
 }
 
 async function createNodeInstallCommand(c: Context<App>) {
@@ -789,6 +881,22 @@ app.post("/api/admin/nodes/:id/install-command", createNodeInstallCommand);
 app.get("/api/deploy/presets", listNodePresets);
 app.post("/api/deploy/nodes", createNodeFromPreset);
 app.post("/api/deploy/nodes/:id/install-command", createNodeInstallCommand);
+app.put("/api/deploy/nodes/:id/traffic", async (c) => {
+  assertMutation(c);
+  const node = await c.env.DB.prepare(
+    `SELECT n.*, b.manifest_json FROM nodes n JOIN backend_repositories b ON b.id = n.backend_repository_id
+     WHERE n.id = ? AND n.owner_admin_id = ? AND n.status != 'archived'`,
+  ).bind(c.req.param("id"), c.get("user").id).first<NodeRow & { manifest_json: string }>();
+  if (!node) return c.json({ error: "节点不存在或不属于当前用户" }, 404);
+  if (!parseBackendCapabilities(node.manifest_json).includes("nodeTrafficLimit")) return c.json({ error: "节点后端不支持流量限额" }, 400);
+  const traffic = normalizeNodeTraffic(await body<unknown>(c));
+  await c.env.DB.prepare(
+    "UPDATE nodes SET traffic_limit_bytes = ?, traffic_reset_day = ?, traffic_direction = ?, updated_at = ? WHERE id = ?",
+  ).bind(traffic.limitBytes, traffic.resetDay, traffic.direction, now(), node.id).run();
+  const updated = { ...node, traffic_limit_bytes: traffic.limitBytes, traffic_reset_day: traffic.resetDay, traffic_direction: traffic.direction };
+  await audit(c.env, c.get("user").id, "node.traffic.update", "node", node.id, traffic);
+  return c.json({ ok: true, traffic: await nodeTrafficStatus(c.env, updated) });
+});
 
 app.post("/api/node/v1/bootstrap", async (c) => {
   const input = await body<{ installToken: string; generatedOutputs?: Record<string, unknown>; agentVersion?: string }>(c);
@@ -850,9 +958,12 @@ app.get("/api/admin/overview", async (c) => {
 });
 
 app.get("/api/admin/nodes", async (c) => {
-  const rows = await c.env.DB.prepare("SELECT id, name, protocol, status, config_json, last_seen_at, online_count, agent_version, created_at, updated_at FROM nodes WHERE owner_admin_id = ? ORDER BY created_at DESC")
-    .bind(c.get("user").id).all();
-  return c.json({ nodes: rows.results.map((row) => ({ ...row, config: JSON.parse(String(row.config_json)), config_json: undefined })) });
+  const rows = await c.env.DB.prepare(
+    `SELECT n.*, b.manifest_json FROM nodes n LEFT JOIN backend_repositories b ON b.id = n.backend_repository_id
+     WHERE n.owner_admin_id = ? ORDER BY n.created_at DESC`,
+  ).bind(c.get("user").id).all<NodeRow & { manifest_json: string | null }>();
+  const nodes = await nodesWithTraffic(c.env, rows.results);
+  return c.json({ nodes: nodes.map((row) => ({ ...row, trafficSupported: parseBackendCapabilities(row.manifest_json || "{}").includes("nodeTrafficLimit"), config: JSON.parse(row.config_json), config_json: undefined, token_hash: undefined, manifest_json: undefined })) });
 });
 
 app.post("/api/admin/nodes", async (c) => {
@@ -1048,10 +1159,12 @@ app.put("/api/owner/settings/site-mode", async (c) => {
 
 app.get("/api/owner/nodes", async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT n.*, u.email AS owner_email FROM nodes n JOIN users u ON u.id = n.owner_admin_id ORDER BY
+    `SELECT n.*, u.email AS owner_email, b.manifest_json FROM nodes n JOIN users u ON u.id = n.owner_admin_id
+      LEFT JOIN backend_repositories b ON b.id = n.backend_repository_id ORDER BY
       CASE n.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 WHEN 'suspended' THEN 2 ELSE 3 END, n.created_at DESC`,
-  ).all<NodeRow>();
-  return c.json({ nodes: rows.results.map((row) => ({ ...row, config: JSON.parse(row.config_json), config_json: undefined, token_hash: undefined })) });
+  ).all<NodeRow & { manifest_json: string | null }>();
+  const nodes = await nodesWithTraffic(c.env, rows.results);
+  return c.json({ nodes: nodes.map((row) => ({ ...row, trafficSupported: parseBackendCapabilities(row.manifest_json || "{}").includes("nodeTrafficLimit"), config: JSON.parse(row.config_json), config_json: undefined, token_hash: undefined, manifest_json: undefined })) });
 });
 
 app.post("/api/owner/nodes", async (c) => {
@@ -1483,7 +1596,9 @@ app.get("/api/node/v1/config", async (c) => {
   if (!node) return c.json({ error: "节点令牌无效" }, 401);
   const timestamp = now();
   const mode = await siteMode(c.env);
-  const planUsers = node.status === "approved" && mode === "plan"
+  const traffic = await nodeTrafficStatus(c.env, node, timestamp);
+  const available = node.status === "approved" && traffic?.available !== false;
+  const planUsers = available && mode === "plan"
     ? await c.env.DB.prepare(
       `SELECT DISTINCT u.id, u.access_uuid, u.access_secret, e.ends_at, e.quota_bytes,
         COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) AS used_bytes
@@ -1493,10 +1608,10 @@ app.get("/api/node/v1/config", async (c) => {
        WHERE e.status = 'active' AND e.starts_at <= ? AND e.ends_at > ? AND u.status = 'active'
          AND COALESCE(q.up_bytes, 0) + COALESCE(q.down_bytes, 0) < e.quota_bytes`,
     ).bind(node.id, monthKey(), timestamp, timestamp).all<Record<string, unknown>>() : { results: [] as Record<string, unknown>[] };
-  const directRows = node.status === "approved" && mode === "direct" ? await directGrants(c.env, { nodeId: node.id }) : [];
+  const directRows = available && mode === "direct" ? await directGrants(c.env, { nodeId: node.id }) : [];
   const directUsers = directRows.filter((grant) => directGrantActive(grant, timestamp));
   return c.json({
-    node: { id: node.id, name: node.name, protocol: node.protocol, status: node.status, config: JSON.parse(node.config_json), updatedAt: node.updated_at },
+    node: { id: node.id, name: node.name, protocol: node.protocol, status: node.status, available, traffic, config: JSON.parse(node.config_json), updatedAt: node.updated_at },
     siteMode: mode,
     users: mode === "plan" ? planUsers.results.map((user) => ({ id: user.id, uuid: user.access_uuid, secret: user.access_secret, expiresAt: user.ends_at, quotaBytes: user.quota_bytes, usedBytes: user.used_bytes, quotaCycle: "monthly", unlimited: false }))
       : directUsers.map((grant) => ({ id: grant.user_id, uuid: grant.access_uuid, secret: grant.access_secret, expiresAt: grant.expires_at, quotaBytes: grant.quota_bytes, usedBytes: Number(grant.used_bytes), quotaCycle: grant.quota_cycle, unlimited: grant.expires_at == null && grant.quota_bytes == null })),
@@ -1588,9 +1703,10 @@ app.get("/sub/:token", async (c) => {
     `SELECT n.*, un.multiplier_bps FROM nodes n JOIN user_nodes un ON un.node_id = n.id AND un.user_id = ?
      WHERE n.id IN (${activeDirectGrants.map(() => "?").join(",")}) ORDER BY n.name`,
   ).bind(user.id, ...activeDirectGrants.map((grant) => grant.node_id)).all<NodeRow>() : { results: [] as NodeRow[] };
-  if (mode === "direct" && !nodes.results.length) return c.text("当前没有有效的节点授权", 403);
+  const availableNodes = (await nodesWithTraffic(c.env, nodes.results, timestamp)).filter((node) => node.traffic?.available !== false);
+  if (!availableNodes.length) return c.text(mode === "direct" ? "当前没有有效的节点授权" : "当前没有可用节点", 403);
   try {
-    const result = renderSubscription(c.req.query("target") || "clash", nodes.results, { uuid: user.accessUuid, secret: user.accessSecret });
+    const result = renderSubscription(c.req.query("target") || "clash", availableNodes, { uuid: user.accessUuid, secret: user.accessSecret });
     const headers = new Headers({ "content-type": result.contentType, "cache-control": "no-store, private" });
     if (entitlement) headers.set("subscription-userinfo", `upload=${Number(usage?.used || 0)}; download=0; total=${entitlement.quota_bytes}`);
     if (result.skipped.length) headers.set("x-boardless-skipped", encodeURIComponent(result.skipped.join(",")));

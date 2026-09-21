@@ -1,6 +1,7 @@
 import type { Protocol } from "./types";
 
 export const BACKEND_RECOGNITION_CODE = "BOARDLESS_BACKEND_REPOSITORY_V1";
+export type BackendCapability = "nodeTrafficLimit";
 
 export type BackendInputType = "text" | "hostname" | "email" | "number" | "url" | "password" | "select" | "checkbox";
 
@@ -43,6 +44,7 @@ export interface BackendManifest {
   name: string;
   version: string;
   panelApiVersion: "v1";
+  capabilities: BackendCapability[];
   install: { script: string; sha256: string; uninstallScript?: string };
   presets: BackendPreset[];
 }
@@ -199,6 +201,10 @@ export function parseBackendManifest(readme: string): BackendManifest {
   if (source.recognitionCode !== BACKEND_RECOGNITION_CODE) throw new Error("recognitionCode 不匹配");
   if (source.schemaVersion !== 1) throw new Error("仅支持后端 Schema v1");
   if (source.panelApiVersion !== "v1") throw new Error("后端不兼容 BoardLess 节点 API v1");
+  if (source.capabilities === undefined) throw new Error("capabilities 必须声明 nodeTrafficLimit");
+  const capabilities = names(source.capabilities, "capabilities") as BackendCapability[];
+  if (capabilities.some((capability) => capability !== "nodeTrafficLimit")) throw new Error("capabilities 包含不受支持的能力");
+  if (!capabilities.includes("nodeTrafficLimit")) throw new Error("capabilities 必须声明 nodeTrafficLimit");
   const backendId = shortText(source.backendId, "backendId", 128);
   if (!/^[a-z0-9]+(?:[._-][a-z0-9]+)+$/.test(backendId)) throw new Error("backendId 格式无效");
   const install = record(source.install, "install");
@@ -237,6 +243,7 @@ export function parseBackendManifest(readme: string): BackendManifest {
     name: shortText(source.name, "name", 100),
     version: shortText(source.version, "version", 80),
     panelApiVersion: "v1",
+    capabilities,
     install: {
       script,
       sha256: digest,

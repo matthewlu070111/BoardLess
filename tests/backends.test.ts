@@ -8,6 +8,7 @@ const manifest = {
   name: "Example Agent",
   version: "1.0.0",
   panelApiVersion: "v1",
+  capabilities: ["nodeTrafficLimit"],
   install: { script: "scripts/install.sh", sha256: "a".repeat(64) },
   presets: [{
     id: "vless-reality", name: "VLESS Reality", protocol: "vless", description: "test",
@@ -24,6 +25,7 @@ describe("backend repository manifests", () => {
   it("parses a valid manifest and renders declared inputs", () => {
     const parsed = parseBackendManifest(readme());
     expect(parsed.backendId).toBe("com.example.agent");
+    expect(parsed.capabilities).toEqual(["nodeTrafficLimit"]);
     expect(parsed.presets[0].inputs).toEqual([{ key: "server", label: "节点地址", type: "hostname", placeholder: "node.example.com", help: "公网地址", installArg: "--domain", required: true }]);
     expect(renderPresetConfig(parsed.presets[0].config, { server: "node.example.com" })).toEqual({ server: "node.example.com", port: 443, publicKey: "{{ generated.publicKey }}" });
     expect(renderPresetConfig(parsed.presets[0].config, { server: "node.example.com" }, { publicKey: "pub" })).toEqual({ server: "node.example.com", port: 443, publicKey: "pub" });
@@ -34,6 +36,12 @@ describe("backend repository manifests", () => {
     expect(parseBackendManifest(readme({ ...manifest, presets: legacyPresets })).presets[0].inputs).toEqual([{ key: "server", label: "server", type: "text", required: true }]);
     const invalidPresets = [{ ...manifest.presets[0], inputs: [{ key: "mode", label: "模式", type: "select", options: [] }], config: { mode: "{{ input.mode }}" } }];
     expect(() => parseBackendManifest(readme({ ...manifest, presets: invalidPresets }))).toThrow("options");
+  });
+
+  it("requires the node traffic limit capability", () => {
+    const { capabilities: _capabilities, ...legacy } = manifest;
+    expect(() => parseBackendManifest(readme(legacy))).toThrow("nodeTrafficLimit");
+    expect(() => parseBackendManifest(readme({ ...manifest, capabilities: [] }))).toThrow("nodeTrafficLimit");
   });
 
   it("parses conditional checkbox and sensitive installation fields", () => {

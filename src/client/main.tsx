@@ -294,8 +294,24 @@ function DangerDialog({ action, onClose }: { action: DangerAction | null; onClos
   </form></div>;
 }
 
+function TrafficSummary({ node }: { node: Json }) {
+  if (!node.trafficSupported) return null;
+  if (!node.traffic) return <small className="cell-sub">流量额度：未配置</small>;
+  return <small className="cell-sub">{node.traffic.available ? "可用" : "额度耗尽"} · 上 {bytes(node.traffic.upBytes)} / 下 {bytes(node.traffic.downBytes)} · 计费 {bytes(node.traffic.usedBytes)} / {bytes(node.traffic.limitBytes)} · {date(node.traffic.nextResetAt)} 重置</small>;
+}
+
+function TrafficDialog({ node, onClose, onSaved }: { node: Json | null; onClose(): void; onSaved(): Promise<void> }) {
+  const [limitGb, setLimitGb] = useState(""); const [resetDay, setResetDay] = useState("1"); const [direction, setDirection] = useState("both");
+  const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  useEffect(() => { setLimitGb(node?.traffic ? String(node.traffic.limitBytes / 1024 ** 3) : ""); setResetDay(String(node?.traffic?.resetDay || 1)); setDirection(node?.traffic?.direction || "both"); setError(""); }, [node]);
+  if (!node) return null;
+  const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(""); try { await api(`/api/deploy/nodes/${node.id}/traffic`, { method: "PUT", body: JSON.stringify({ limitBytes: Math.round(Number(limitGb) * 1024 ** 3), resetDay: Number(resetDay), direction }) }); await onSaved(); onClose(); } catch (reason) { setError(reason instanceof Error ? reason.message : "保存失败"); } finally { setBusy(false); } };
+  return <div className="modal-layer"><form className="modal" onSubmit={submit}><button type="button" className="modal-close" onClick={onClose}>×</button><p className="eyebrow">节点流量额度</p><h2>{node.name}</h2><div className="form-grid"><Field label="总额度（GB）"><input type="number" min="0.000001" step="any" required value={limitGb} onChange={(event) => setLimitGb(event.target.value)} /></Field><Field label="每月重置日"><input type="number" min="1" max="31" required value={resetDay} onChange={(event) => setResetDay(event.target.value)} /></Field><Field label="计费方向"><select value={direction} onChange={(event) => setDirection(event.target.value)}><option value="up">上行</option><option value="down">下行</option><option value="both">上下行合计</option></select></Field></div>{error && <Notice tone="danger">{error}</Notice>}<div className="modal-actions"><button type="button" className="button" onClick={onClose}>取消</button><button className="button primary" disabled={busy}>{busy ? "保存中…" : "保存"}</button></div></form></div>;
+}
+
 function AdminNodes() {
   const [nodes, setNodes] = useState<Json[] | null>(null); const [token, setToken] = useState("");
+  const [trafficNode, setTrafficNode] = useState<Json | null>(null);
   const [danger, setDanger] = useState<DangerAction | null>(null);
   const load = () => api<{ nodes: Json[] }>("/api/admin/nodes").then((r) => setNodes(r.nodes)); useEffect(() => { void load(); }, []);
   const rotate = (node: Json) => setDanger({ title: `轮换节点“${node.name}”的令牌`, description: "旧令牌会立即失效，节点 Agent 必须改用新令牌。", confirmLabel: "确认轮换", run: async () => { const result = await api<Json>(`/api/admin/nodes/${node.id}/rotate-token`, { method: "POST", body: "{}" }); setToken(result.token); } });
@@ -303,7 +319,8 @@ function AdminNodes() {
   if (!nodes) return <Loading />;
   return <Page title="我的节点" description="新增节点的后端、协议和配置项均由站长启用的后端仓库提供" action={<Link className="button primary" to="/admin/deploy">＋ 新增节点</Link>}>
     {token && <Notice tone="success"><strong>请立即保存节点令牌：</strong><code className="token">{token}</code><button className="link-button" onClick={() => navigator.clipboard.writeText(token)}>复制</button>。关闭后无法再次查看。</Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>协议</th><th>状态</th><th>在线</th><th>最后心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => <tr key={node.id}><td><strong>{node.name}</strong><small className="cell-sub">{node.config.server}:{node.config.port}</small></td><td className="upper">{node.protocol}</td><td><Badge value={node.status} /></td><td>{node.online_count}</td><td>{date(node.last_seen_at)}</td><td className="actions"><button type="button" className="link-button" onClick={() => rotate(node)}>轮换令牌</button><button type="button" className="link-button negative" onClick={() => remove(node)}>删除</button></td></tr>)}</tbody></table>{!nodes.length && <Empty>还没有节点</Empty>}</section>
+    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>协议</th><th>状态</th><th>在线</th><th>最后心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => <tr key={node.id}><td><strong>{node.name}</strong><small className="cell-sub">{node.config.server}:{node.config.port}</small><TrafficSummary node={node} /></td><td className="upper">{node.protocol}</td><td><Badge value={node.status} /></td><td>{node.online_count}</td><td>{date(node.last_seen_at)}</td><td className="actions">{node.trafficSupported && <button type="button" className="link-button" onClick={() => setTrafficNode(node)}>流量额度</button>}<button type="button" className="link-button" onClick={() => rotate(node)}>轮换令牌</button><button type="button" className="link-button negative" onClick={() => remove(node)}>删除</button></td></tr>)}</tbody></table>{!nodes.length && <Empty>还没有节点</Empty>}</section>
+    <TrafficDialog node={trafficNode} onClose={() => setTrafficNode(null)} onSaved={load} />
     <DangerDialog action={danger} onClose={() => setDanger(null)} />
   </Page>;
 }
@@ -314,6 +331,9 @@ function NodeDeploy({ returnTo }: { returnTo: string }) {
   const [presetId, setPresetId] = useState("");
   const [name, setName] = useState("");
   const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [trafficLimitGb, setTrafficLimitGb] = useState("1000");
+  const [trafficResetDay, setTrafficResetDay] = useState("1");
+  const [trafficDirection, setTrafficDirection] = useState("both");
   const [command, setCommand] = useState("");
   const [expiresAt, setExpiresAt] = useState(0);
   const [error, setError] = useState("");
@@ -332,7 +352,8 @@ function NodeDeploy({ returnTo }: { returnTo: string }) {
     if (!selected) return;
     setBusy(true); setError(""); setCommand("");
     try {
-      const created = await api<Json>("/api/deploy/nodes", { method: "POST", body: JSON.stringify({ backendId: selected.backend_id, presetId: selected.preset_id, name, inputs }) });
+      const traffic = selected.capabilities?.includes("nodeTrafficLimit") ? { limitBytes: Math.round(Number(trafficLimitGb) * 1024 ** 3), resetDay: Number(trafficResetDay), direction: trafficDirection } : undefined;
+      const created = await api<Json>("/api/deploy/nodes", { method: "POST", body: JSON.stringify({ backendId: selected.backend_id, presetId: selected.preset_id, name, inputs, traffic }) });
       const installed = await api<Json>(`/api/deploy/nodes/${created.node.id}/install-command`, { method: "POST", body: JSON.stringify({ inputs }) });
       setCommand(installed.command); setExpiresAt(installed.expiresAt);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "创建安装命令失败"); }
@@ -349,6 +370,7 @@ function NodeDeploy({ returnTo }: { returnTo: string }) {
         {selected && <Notice>{selected.description || `${selected.protocol} 节点预设`}<br />固定提交：<code>{String(selected.commit_sha).slice(0, 12)}</code>{selected.generatedOutputs.length ? `；安装时生成 ${selected.generatedOutputs.join("、")}` : ""}</Notice>}
         <Field label="节点名称"><input required maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：香港 01" /></Field>
         {visibleInputs.map((field: Json) => field.type === "checkbox" ? <label className="check backend-toggle" key={field.key}><input type="checkbox" checked={inputs[field.key] === "true"} onChange={(event) => setInputs({ ...inputs, [field.key]: event.target.checked ? "true" : "false" })} /><span><strong>{field.label}</strong>{field.help && <small>{field.help}</small>}</span></label> : <Field key={field.key} label={field.label} hint={field.help}>{field.type === "select" ? <select required={field.required !== false} value={inputs[field.key] || ""} onChange={(event) => setInputs({ ...inputs, [field.key]: event.target.value })}><option value="" disabled>请选择</option>{field.options.map((option: Json) => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : <input required={field.required !== false} type={field.type === "email" ? "email" : field.type === "number" ? "number" : field.type === "url" ? "url" : field.type === "password" ? "password" : "text"} maxLength={512} autoComplete={field.type === "password" ? "off" : undefined} placeholder={field.placeholder || ""} value={inputs[field.key] || ""} onChange={(event) => setInputs({ ...inputs, [field.key]: event.target.value })} />}</Field>)}
+        {selected?.capabilities?.includes("nodeTrafficLimit") && <><h2>节点流量额度</h2><Field label="总额度（GB）"><input type="number" min="0.000001" step="any" required value={trafficLimitGb} onChange={(event) => setTrafficLimitGb(event.target.value)} /></Field><Field label="每月重置日"><input type="number" min="1" max="31" required value={trafficResetDay} onChange={(event) => setTrafficResetDay(event.target.value)} /></Field><Field label="计费方向"><select value={trafficDirection} onChange={(event) => setTrafficDirection(event.target.value)}><option value="up">上行</option><option value="down">下行</option><option value="both">上下行合计</option></select></Field></>}
         <button className="button primary" disabled={busy}>{busy ? "正在生成…" : "创建节点并生成安装命令"}</button>
       </form>
       <section className="panel command-panel">
@@ -390,6 +412,7 @@ function OwnerDashboard() {
 function OwnerNodes() {
   const { user } = useAuth();
   const [nodes, setNodes] = useState<Json[] | null>(null); const [token, setToken] = useState("");
+  const [trafficNode, setTrafficNode] = useState<Json | null>(null);
   const [danger, setDanger] = useState<DangerAction | null>(null);
   const load = () => api<{ nodes: Json[] }>("/api/owner/nodes").then((r) => setNodes(r.nodes)); useEffect(() => { void load(); }, []);
   const action = async (id: string, value: "approve" | "suspend") => { await api(`/api/owner/nodes/${id}/action`, { method: "POST", body: JSON.stringify({ action: value }) }); await load(); };
@@ -399,7 +422,8 @@ function OwnerNodes() {
   if (!nodes) return <Loading />;
   return <Page title="节点管理" description="新增节点的后端、协议和配置项均由已启用的后端仓库提供" action={<Link className="button primary" to="/owner/deploy">＋ 新增节点</Link>}>
     {token && <Notice tone="success"><strong>请立即保存节点令牌：</strong><code className="token">{token}</code><button className="link-button" onClick={() => navigator.clipboard.writeText(token)}>复制</button>。关闭后无法再次查看。</Notice>}
-    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>归属</th><th>协议</th><th>地址</th><th>状态</th><th>心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => { const own = node.owner_admin_id === user?.id; return <tr key={node.id}><td><strong>{node.name}</strong></td><td>{own ? "站长自营" : node.owner_email}</td><td className="upper">{node.protocol}</td><td className="mono">{node.config.server}:{node.config.port}</td><td><Badge value={node.status} /></td><td>{date(node.last_seen_at)}</td><td className="actions">{own ? <>{node.status === "pending" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status !== "archived" && <button type="button" className="link-button" onClick={() => rotate(node)}>轮换令牌</button>}{node.status !== "archived" && <button type="button" className="link-button negative" onClick={() => archive(node)}>归档</button>}</> : <>{node.status !== "approved" && node.status !== "archived" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status === "approved" && <button className="link-button negative" onClick={() => action(node.id, "suspend")}>停用</button>}</>}<button type="button" className="link-button negative" onClick={() => remove(node)}>删除</button></td></tr>; })}</tbody></table>{!nodes.length && <Empty>暂无节点</Empty>}</section>
+    <section className="panel table-wrap"><table><thead><tr><th>节点</th><th>归属</th><th>协议</th><th>地址</th><th>状态</th><th>心跳</th><th></th></tr></thead><tbody>{nodes.map((node) => { const own = node.owner_admin_id === user?.id; return <tr key={node.id}><td><strong>{node.name}</strong><TrafficSummary node={node} /></td><td>{own ? "站长自营" : node.owner_email}</td><td className="upper">{node.protocol}</td><td className="mono">{node.config.server}:{node.config.port}</td><td><Badge value={node.status} /></td><td>{date(node.last_seen_at)}</td><td className="actions">{own ? <>{node.status === "pending" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.trafficSupported && node.status !== "archived" && <button type="button" className="link-button" onClick={() => setTrafficNode(node)}>流量额度</button>}{node.status !== "archived" && <button type="button" className="link-button" onClick={() => rotate(node)}>轮换令牌</button>}{node.status !== "archived" && <button type="button" className="link-button negative" onClick={() => archive(node)}>归档</button>}</> : <>{node.status !== "approved" && node.status !== "archived" && <button className="link-button positive" onClick={() => action(node.id, "approve")}>审核通过</button>}{node.status === "approved" && <button className="link-button negative" onClick={() => action(node.id, "suspend")}>停用</button>}</>}<button type="button" className="link-button negative" onClick={() => remove(node)}>删除</button></td></tr>; })}</tbody></table>{!nodes.length && <Empty>暂无节点</Empty>}</section>
+    <TrafficDialog node={trafficNode} onClose={() => setTrafficNode(null)} onSaved={load} />
     <DangerDialog action={danger} onClose={() => setDanger(null)} />
   </Page>;
 }

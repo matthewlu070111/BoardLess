@@ -23,7 +23,7 @@ describe("node installation bootstrap", () => {
       db.prepare("INSERT INTO users (id, email, password_hash, status, access_uuid, access_secret, created_at) VALUES ('usr_owner', 'owner@example.com', 'unused', 'active', 'uuid', 'secret', ?)").bind(timestamp),
       db.prepare("INSERT INTO user_roles (user_id, role) VALUES ('usr_owner', 'owner')"),
       db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, 'usr_owner', ?, ?)").bind(await sha256(sessionToken), timestamp + 300, timestamp),
-      db.prepare("INSERT INTO backend_repositories (id, backend_id, repository_url, repository_owner, repository_name, requested_ref, commit_sha, readme_path, readme_url, readme_hash, name, version, panel_api_version, install_script, install_script_url, install_sha256, manifest_json, status, imported_by, created_at, updated_at, synced_at) VALUES ('backend_1', 'com.example.agent', 'https://github.com/example/agent', 'example', 'agent', 'v1', ?, 'README.md', 'https://raw.example/readme', 'hash', 'Agent', '1.0.0', 'v1', 'scripts/install.sh', 'https://raw.example/install', ?, '{}', 'enabled', 'usr_owner', ?, ?, ?)").bind("a".repeat(40), "b".repeat(64), timestamp, timestamp, timestamp),
+      db.prepare("INSERT INTO backend_repositories (id, backend_id, repository_url, repository_owner, repository_name, requested_ref, commit_sha, readme_path, readme_url, readme_hash, name, version, panel_api_version, install_script, install_script_url, install_sha256, manifest_json, status, imported_by, created_at, updated_at, synced_at) VALUES ('backend_1', 'com.example.agent', 'https://github.com/example/agent', 'example', 'agent', 'v1', ?, 'README.md', 'https://raw.example/readme', 'hash', 'Agent', '1.0.0', 'v1', 'scripts/install.sh', 'https://raw.example/install', ?, ?, 'enabled', 'usr_owner', ?, ?, ?)").bind("a".repeat(40), "b".repeat(64), JSON.stringify({ capabilities: ["nodeTrafficLimit"] }), timestamp, timestamp, timestamp),
       db.prepare("INSERT INTO backend_presets (backend_repository_id, preset_id, name, protocol, description, config_json, required_inputs_json, generated_outputs_json) VALUES ('backend_1', 'tls', 'TLS', 'vless', '', ?, ?, '[]')")
         .bind(JSON.stringify({ server: "{{ input.server }}", port: 443, transport: "tcp", tls: true, sni: "{{ input.server }}" }), JSON.stringify([
           { key: "server", label: "节点域名", type: "hostname", installArg: "--domain" },
@@ -37,8 +37,12 @@ describe("node installation bootstrap", () => {
       BOOTSTRAP_SECRET: "test-bootstrap-secret", ALIPAY_APP_ID: "", ALIPAY_PRIVATE_KEY: "", ALIPAY_PUBLIC_KEY: "", ALIPAY_GATEWAY: "",
     };
     const headers = { "content-type": "application/json", cookie: `boardless_session=${sessionToken}` };
-    const createdResponse = await app.request("http://localhost/api/deploy/nodes", {
+    const missingTraffic = await app.request("http://localhost/api/deploy/nodes", {
       method: "POST", headers, body: JSON.stringify({ backendId: "com.example.agent", presetId: "tls", name: "Node", inputs: { server: "node.example.com", enableVps: "true", vpsUrl: "https://vps.example.com", vpsToken: "one-time-secret" } }),
+    }, env);
+    expect(missingTraffic.status).toBe(400);
+    const createdResponse = await app.request("http://localhost/api/deploy/nodes", {
+      method: "POST", headers, body: JSON.stringify({ backendId: "com.example.agent", presetId: "tls", name: "Node", inputs: { server: "node.example.com", enableVps: "true", vpsUrl: "https://vps.example.com", vpsToken: "one-time-secret" }, traffic: { limitBytes: 1000, resetDay: 31, direction: "both" } }),
     }, env);
     expect(createdResponse.status).toBe(201);
     const created = await createdResponse.json() as { node: { id: string } };
@@ -53,8 +57,9 @@ describe("node installation bootstrap", () => {
       .first<{ inputs_json: string; expires_at: number; created_at: number }>();
     expect(JSON.parse(saved!.inputs_json)).toEqual({ server: "node.example.com", enableVps: "true", vpsUrl: "https://vps.example.com" });
     expect(saved!.expires_at - saved!.created_at).toBe(30 * 60);
-    const node = await db.prepare("SELECT backend_inputs_json FROM nodes WHERE id = ?").bind(created.node.id).first<{ backend_inputs_json: string }>();
+    const node = await db.prepare("SELECT backend_inputs_json, traffic_limit_bytes, traffic_reset_day, traffic_direction FROM nodes WHERE id = ?").bind(created.node.id).first<{ backend_inputs_json: string; traffic_limit_bytes: number; traffic_reset_day: number; traffic_direction: string }>();
     expect(JSON.parse(node!.backend_inputs_json).vpsToken).toBe("");
+    expect(node).toMatchObject({ traffic_limit_bytes: 1000, traffic_reset_day: 31, traffic_direction: "both" });
     database.close();
   });
 

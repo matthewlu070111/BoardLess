@@ -40,6 +40,9 @@ export interface NodeRow {
   last_seen_at: number | null;
   online_count: number;
   agent_version: string | null;
+  traffic_limit_bytes?: number | null;
+  traffic_reset_day?: number | null;
+  traffic_direction?: "up" | "down" | "both" | null;
   created_at: number;
   updated_at: number;
   multiplier_bps?: number;

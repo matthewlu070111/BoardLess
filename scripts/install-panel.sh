@@ -317,9 +317,11 @@ ensure_base_tools() {
 }
 
 ensure_docker() {
+  local requested_version="$VERSION"
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     . /etc/os-release
+    VERSION="$requested_version"
     case "${ID:-}" in
       ubuntu|debian)
         local docker_codename="${VERSION_CODENAME:-}"

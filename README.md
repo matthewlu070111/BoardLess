@@ -177,16 +177,18 @@ Cloudflare 还提供两种手动触发构建的方式：Deploy Hook 可以重新
 - 自动执行未应用的数据库 migration
 - 等待健康检查通过
 
-推荐更新命令如下，示例更新到 `v0.2.0`：
+如果你想“更新到当前上游最新版本”，最稳妥的方式不是传 `main`，而是先获取最新 commit SHA，再用 SHA 执行升级。这样是固定版本，不会因为分支移动导致升级漂移。
 
 ```bash
+LATEST_SHA=$(git ls-remote https://github.com/matthewlu070111/BoardLess.git HEAD | awk '{print $1}')
+
 curl -fsSL \
   'https://raw.githubusercontent.com/matthewlu070111/BoardLess/refs/heads/main/scripts/install-panel.sh' \
   -o /tmp/boardless-update.sh
 
 sudo bash /tmp/boardless-update.sh \
   --repository 'https://github.com/matthewlu070111/BoardLess.git' \
-  --version 'v0.2.0' \
+  --version "$LATEST_SHA" \
   --domain 'panel.example.com' \
   --install-dir '/opt/boardless' \
   --data-dir '/var/lib/boardless' \
@@ -197,7 +199,7 @@ sudo bash /tmp/boardless-update.sh \
 
 如果第一次安装没有启用 Caddy，就不要传 `--with-caddy`，并补上原来的 `--listen-port`。如果当前站点使用的是原来的端口 3000，保持一致即可。
 
-`--version` 也可以改成确定的提交 SHA；如果你已经在本地维护源码副本，可以改用 `--source-dir /path/to/boardless`。但无论哪种方式，更新都应使用同一套安装目录和数据目录，而不是新建目录覆盖旧安装。
+如果你更偏好固定版本，也可以替换成 `--version 'v0.2.0'` 或某个确定的提交 SHA。`main`、`master` 和 `HEAD` 会被脚本拒绝，因为它们属于可变引用，不适合作为生产升级目标。
 
 更新失败时，先看服务日志：
 
@@ -208,7 +210,7 @@ sudo /opt/boardless/boardlessctl logs --tail 200 boardless
 
 如果需要回滚，应重新运行同一脚本，传回原来的版本标签或提交 SHA，并在恢复数据库前保留当前数据目录中的备份。恢复时直接将 `/var/lib/boardless/backups/` 中对应的 SQLite 文件覆盖当前数据库即可；该操作会覆盖升级后的数据，因此请先额外备份当前状态。
 
-> 结论：正确的自托管更新方式是“重新执行安装脚本”，而不是“在安装目录里手工 `git pull` 后重启”。这能保证环境变量、密钥、数据库备份、Caddy 配置和 Docker 编排保持一致。
+> 结论：正确的自托管更新方式是“先拿到最新 SHA，再重新执行安装脚本升级”，而不是“在安装目录里手工 `git pull` 后重启”。这样才能保证环境变量、密钥、数据库备份、Caddy 配置和 Docker 编排保持一致。
 
 ## 本地开发
 

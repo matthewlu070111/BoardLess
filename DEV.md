@@ -758,30 +758,20 @@ https://github.com/<OWNER>/<BACKEND_REPO>
 1. 站长填写仓库 URL，可选填写分支、标签或提交 SHA；默认读取仓库默认分支
 2. BoardLess 服务端解析为严格的 `owner/repository`，不接受任意下载域名
 3. 服务端通过 GitHub API 解析本次导入对应的不可变提交 SHA
-4. 服务端读取该提交中的 `README.md`
-5. 检查 README 是否包含 BoardLess 后端特征识别码
-6. 解析识别块中的结构化元数据和配置预设
+4. 服务端读取该提交中的独立后端识别文件，默认路径为 `boardless-backend.json`
+5. 检查识别文件中的 `recognitionCode`
+6. 解析结构化元数据和配置预设
 7. 校验脚本路径、哈希、协议配置和 API 兼容版本
 8. 向站长展示仓库、提交 SHA、后端名称、权限需求和预设列表
 9. 站长确认后才保存为“已导入后端”；导入不代表节点立即获得信任
 
 私有仓库可以在未来通过服务器端 GitHub 凭据读取，但凭据不得发送给浏览器或节点服务器。
 
-### 后端仓库特征识别码
+### 独立后端识别文件
 
-兼容后端必须在 README 中包含固定特征码：
+新后端必须把识别清单存放在独立 JSON 文件中，推荐使用仓库根目录的 `boardless-backend.json`。导入时可以显式指定其他仓库内相对路径。文件中的固定特征码只用于确认“该仓库主动声明兼容 BoardLess”，不能代替安全审核：
 
-```markdown
-<!-- BOARDLESS_BACKEND_REPOSITORY_V1 -->
-```
-
-固定特征码只用于确认“该仓库主动声明兼容 BoardLess”，不能代替安全审核。README 还必须包含唯一的结构化识别块：
-
-````markdown
-<!-- BOARDLESS_BACKEND_REPOSITORY_V1 -->
-
-<!-- boardless:backend:start -->
-```json boardless-backend
+```json
 {
   "recognitionCode": "BOARDLESS_BACKEND_REPOSITORY_V1",
   "schemaVersion": 1,
@@ -832,15 +822,15 @@ https://github.com/<OWNER>/<BACKEND_REPO>
   ]
 }
 ```
-<!-- boardless:backend:end -->
-````
+
+为兼容已经发布的后端，BoardLess 仍接受旧版 README 识别块：README 必须同时包含 `<!-- BOARDLESS_BACKEND_REPOSITORY_V1 -->`、唯一的 `boardless:backend:start` / `boardless:backend:end` 区间，以及其中的 `json boardless-backend` 代码段。新后端不得继续使用内嵌格式。
 
 字段约定：
 
 | 字段 | 说明 |
 | --- | --- |
-| `recognitionCode` | 必须精确等于 README 中的固定特征码 |
-| `schemaVersion` | 识别块结构版本，当前规划为 `1` |
+| `recognitionCode` | 必须精确等于 `BOARDLESS_BACKEND_REPOSITORY_V1` |
+| `schemaVersion` | 识别文件结构版本，当前规划为 `1` |
 | `backendId` | 后端永久唯一 ID，发布后不可随意更换 |
 | `panelApiVersion` | 该后端支持的 BoardLess 节点 API 版本 |
 | `capabilities` | 必填能力数组；当前必须包含且只支持 `nodeTrafficLimit` |
@@ -860,19 +850,19 @@ https://github.com/<OWNER>/<BACKEND_REPO>
 
 私钥只能保存在节点服务器。`generatedOutputs` 只能包含公钥、Short ID、公开端口等可公开配置，不能上传 Reality 私钥或其他服务端秘密。
 
-### README 读取与重新同步规则
+### 识别文件读取与重新同步规则
 
-README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 GitHub 内容：
+识别文件必须由 BoardLess 服务端读取，浏览器不直接请求或解析 GitHub 内容：
 
-1. 只解析 `boardless:backend:start` 和 `boardless:backend:end` 之间的 `boardless-backend` JSON
-2. 特征码、`recognitionCode`、`backendId`、Schema、API 版本和强制 `nodeTrafficLimit` 能力必须全部匹配
-3. 仓库 URL、README URL、安装脚本 URL 必须指向同一 GitHub 仓库
-4. README 和安装脚本必须固定到同一个提交 SHA
+1. 新格式直接解析独立 JSON；旧版 README 只解析 `boardless:backend:start` 和 `boardless:backend:end` 之间的 `boardless-backend` JSON
+2. `recognitionCode`、`backendId`、Schema、API 版本和强制 `nodeTrafficLimit` 能力必须全部匹配
+3. 仓库 URL、识别文件 URL、安装脚本 URL 必须指向同一 GitHub 仓库
+4. 识别文件和安装脚本必须固定到同一个提交 SHA
 5. 所有相对路径规范化后不得逃出仓库，禁止 `../` 和外部 URL
 6. 校验协议、模板变量、必填输入、生成字段和脚本 SHA-256
 7. 保存仓库 ID、`backendId`、提交 SHA、读取时间、内容哈希和同步状态
 8. 同一个 `backendId` 不能被另一仓库静默覆盖；仓库转移需站长显式确认
-9. README 中的 HTML、JavaScript 和 Shell 内容只作为文本展示，绝不在面板服务器执行
+9. 旧版 README 中的 HTML、JavaScript 和 Shell 内容只作为文本展示，绝不在面板服务器执行
 10. GitHub 暂时不可用时可以读取最后一次成功缓存，但必须标明缓存提交 SHA
 
 重新同步时先生成差异预览。安装脚本、权限要求、预设或 `backendId` 变化时，必须再次由站长确认，不能自动信任更新后的 `main`。
@@ -884,7 +874,7 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `GET` | `/api/owner/backends` | 列出已导入的后端仓库与同步状态 |
-| `POST` | `/api/owner/backends/import` | 读取仓库 README，验证特征码并返回导入预览 |
+| `POST` | `/api/owner/backends/import` | 读取仓库识别文件，验证特征码并返回导入预览 |
 | `POST` | `/api/owner/backends/:id/confirm` | 确认首次导入或高风险更新 |
 | `POST` | `/api/owner/backends/:id/sync` | 按指定 ref 重新同步并生成差异 |
 | `PATCH` | `/api/owner/backends/:id` | 启用或停用已确认后端；切换 ref 使用同步接口 |
@@ -902,9 +892,11 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 {
   "repositoryUrl": "https://github.com/example/boardless-agent",
   "ref": "v1.0.0",
-  "readmePath": "README.md"
+  "manifestPath": "boardless-backend.json"
 }
 ```
+
+请求仍兼容旧字段 `readmePath`；仅在导入旧版 README 识别块时使用。新客户端和新后端必须使用 `manifestPath`。
 
 服务端响应应包含解析后的提交 SHA、识别码、后端信息、预设摘要、脚本哈希验证结果和风险提示，但不得直接导入或执行脚本。
 
@@ -944,7 +936,7 @@ README 必须由 BoardLess 服务端读取，浏览器不直接请求或解析 G
 配置流程：
 
 1. BoardLess 先展示已启用后端，再展示所选后端的配置方案
-2. BoardLess 严格按 README 中已校验的 `inputs` 生成后端表单，并固定要求节点流量额度、重置日和计费方向
+2. BoardLess 严格按识别文件中已校验的 `inputs` 生成后端表单，并固定要求节点流量额度、重置日和计费方向
 3. 服务端合并预设和管理员输入，浏览器不能自行生成最终配置
 4. 没有 `generatedOutputs` 时直接执行现有 `validateNodeConfig`
 5. 存在安装阶段输出时，先校验已知字段并保持节点为 `pending`
@@ -1117,14 +1109,14 @@ bash scripts/deploy-cloudflare.sh \
 - 安装操作记录版本和提交 SHA，但不记录秘密值
 - 安装脚本提供幂等更新、明确回滚和默认保留数据的卸载方式
 - 节点仓库必须由站长导入并确认；普通管理员不能通过任意 URL 执行脚本
-- README 发生高风险变化后，旧的确认状态失效，必须重新审核
+- 后端识别文件发生高风险变化后，旧的确认状态失效，必须重新审核
 
-### 后端 README 最低要求
+### 后端仓库最低要求
 
-要被 BoardLess 成功识别和导入，后端仓库 README 至少应包含：
+要被 BoardLess 成功识别和导入，后端仓库至少应提供独立的 `boardless-backend.json`，其中包含：
 
-- `BOARDLESS_BACKEND_REPOSITORY_V1` 固定特征识别码
-- 唯一 `backendId` 和 `boardless-backend` JSON 识别块
+- `BOARDLESS_BACKEND_REPOSITORY_V1` 固定 `recognitionCode`
+- 唯一 `backendId`
 - 必填的 `"capabilities": ["nodeTrafficLimit"]`
 - 支持的操作系统和 CPU 架构
 - Agent、代理程序与 BoardLess API 的版本兼容性
@@ -1274,10 +1266,10 @@ failure
 
 ### 一键配置与安装
 
-- 导入时要求 README 同时具有 `BOARDLESS_BACKEND_REPOSITORY_V1` 特征码和唯一 `backendId`
+- 导入时要求独立识别文件同时具有 `BOARDLESS_BACKEND_REPOSITORY_V1` 特征码和唯一 `backendId`
 - 只同步站长已经确认并启用的后端 GitHub 仓库
-- README 识别块必须通过固定标记和 JSON Schema 校验
-- 安装脚本与 README 固定到同一提交 SHA
+- 独立识别文件必须通过 JSON Schema 校验；旧版 README 识别块仅用于兼容
+- 安装脚本与识别文件固定到同一提交 SHA
 - 预设应用后仍调用服务端协议配置校验
 - 安装命令使用短期单次令牌，不把正式节点令牌持久暴露在 Shell 历史中
 - 面板安装脚本与节点后端安装脚本严格分离
@@ -1294,7 +1286,7 @@ failure
 
 - API 尚未提供 OpenAPI/Swagger 描述
 - 列表接口使用固定上限，尚无游标分页
-- 后端仓库导入、README 识别、预设同步、一次性安装命令和节点 bootstrap 已实现；实际节点 Agent 与各后端的安装脚本由对应后端仓库提供
+- 后端仓库导入、独立识别文件校验、预设同步、一次性安装命令和节点 bootstrap 已实现；实际节点 Agent 与各后端的安装脚本由对应后端仓库提供
 - 面板一键脚本已支持安装和带数据库备份的重复升级；自动回滚和卸载流程尚未实现
 - 未实现邮件发送、自动退款和支付宝自动转账
 - 节点 Agent 与代理进程不包含在本仓库中

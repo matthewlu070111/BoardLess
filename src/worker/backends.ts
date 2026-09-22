@@ -186,18 +186,22 @@ function validateTemplates(value: unknown, inputs: Set<string>, generated: Set<s
   }
 }
 
-export function parseBackendManifest(readme: string): BackendManifest {
-  if (readme.length > 512_000) throw new Error("README 超过 512 KB 限制");
-  if (!readme.includes(`<!-- ${BACKEND_RECOGNITION_CODE} -->`)) throw new Error("README 缺少 BoardLess 后端特征识别码");
-  const start = "<!-- boardless:backend:start -->";
-  const end = "<!-- boardless:backend:end -->";
-  if (readme.split(start).length !== 2 || readme.split(end).length !== 2) throw new Error("README 必须包含唯一的后端识别块");
-  const block = readme.slice(readme.indexOf(start) + start.length, readme.indexOf(end));
-  const match = block.match(/```json\s+boardless-backend\s*\n([\s\S]*?)\n```/);
-  if (!match) throw new Error("后端识别块缺少 json boardless-backend 代码段");
+export function parseBackendManifest(content: string): BackendManifest {
+  if (content.length > 512_000) throw new Error("后端识别文件超过 512 KB 限制");
+  let encoded = content.trim();
+  if (!encoded.startsWith("{")) {
+    if (!content.includes(`<!-- ${BACKEND_RECOGNITION_CODE} -->`)) throw new Error("README 缺少 BoardLess 后端特征识别码");
+    const start = "<!-- boardless:backend:start -->";
+    const end = "<!-- boardless:backend:end -->";
+    if (content.split(start).length !== 2 || content.split(end).length !== 2) throw new Error("README 必须包含唯一的后端识别块");
+    const block = content.slice(content.indexOf(start) + start.length, content.indexOf(end));
+    const match = block.match(/```json\s+boardless-backend\s*\n([\s\S]*?)\n```/);
+    if (!match) throw new Error("后端识别块缺少 json boardless-backend 代码段");
+    encoded = match[1];
+  }
   let raw: unknown;
-  try { raw = JSON.parse(match[1]); } catch { throw new Error("后端识别块不是有效 JSON"); }
-  const source = record(raw, "后端识别块");
+  try { raw = JSON.parse(encoded); } catch { throw new Error("后端识别文件不是有效 JSON"); }
+  const source = record(raw, "后端识别文件");
   if (source.recognitionCode !== BACKEND_RECOGNITION_CODE) throw new Error("recognitionCode 不匹配");
   if (source.schemaVersion !== 1) throw new Error("仅支持后端 Schema v1");
   if (source.panelApiVersion !== "v1") throw new Error("后端不兼容 BoardLess 节点 API v1");
@@ -283,9 +287,9 @@ export async function sha256Hex(value: string | ArrayBuffer): Promise<string> {
   return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-export async function importBackendRepository(repositoryUrl: string, requestedRef = "", readmePath = "README.md"): Promise<ImportedBackend> {
+export async function importBackendRepository(repositoryUrl: string, requestedRef = "", manifestPath = "boardless-backend.json"): Promise<ImportedBackend> {
   const repositoryInfo = parseGitHubRepository(repositoryUrl);
-  const path = safePath(readmePath || "README.md", "readmePath");
+  const path = safePath(manifestPath || "boardless-backend.json", "manifestPath");
   const apiBase = `https://api.github.com/repos/${repositoryInfo.owner}/${repositoryInfo.repository}`;
   let ref = requestedRef.trim();
   if (!ref) {
@@ -297,24 +301,24 @@ export async function importBackendRepository(repositoryUrl: string, requestedRe
   if (!commit.sha || !commitPattern.test(commit.sha)) throw new Error("GitHub 未返回有效提交 SHA");
   const commitSha = commit.sha.toLowerCase();
   const rawBase = `https://raw.githubusercontent.com/${repositoryInfo.owner}/${repositoryInfo.repository}/${commitSha}`;
-  const readmeUrl = `${rawBase}/${path}`;
-  const readme = await responseText(readmeUrl, "text/plain");
-  const manifest = parseBackendManifest(readme);
+  const manifestUrl = `${rawBase}/${path}`;
+  const manifestContent = await responseText(manifestUrl, "text/plain");
+  const manifest = parseBackendManifest(manifestContent);
   const installScriptUrl = `${rawBase}/${manifest.install.script}`;
   const scriptResponse = await fetch(installScriptUrl, { headers: { "User-Agent": "BoardLess/1.0" }, signal: AbortSignal.timeout(12_000) });
   if (!scriptResponse.ok) throw new Error(`安装脚本读取失败 (${scriptResponse.status})`);
   const script = await scriptResponse.arrayBuffer();
   if (script.byteLength > 1_000_000) throw new Error("安装脚本超过 1 MB 限制");
   const actualDigest = await sha256Hex(script);
-  if (actualDigest !== manifest.install.sha256) throw new Error("安装脚本 SHA-256 与 README 声明不一致");
+  if (actualDigest !== manifest.install.sha256) throw new Error("安装脚本 SHA-256 与后端识别文件声明不一致");
   return {
     ...repositoryInfo,
     requestedRef: ref,
     commitSha,
     readmePath: path,
-    readmeUrl,
+    readmeUrl: manifestUrl,
     installScriptUrl,
-    readmeHash: await sha256Hex(readme),
+    readmeHash: await sha256Hex(manifestContent),
     manifest,
   };
 }

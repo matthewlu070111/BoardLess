@@ -21,14 +21,22 @@ function readme(value: unknown = manifest) {
   return `<!-- ${BACKEND_RECOGNITION_CODE} -->\n<!-- boardless:backend:start -->\n\`\`\`json boardless-backend\n${JSON.stringify(value)}\n\`\`\`\n<!-- boardless:backend:end -->`;
 }
 
+function standalone(value: unknown = manifest) {
+  return JSON.stringify(value);
+}
+
 describe("backend repository manifests", () => {
   it("parses a valid manifest and renders declared inputs", () => {
-    const parsed = parseBackendManifest(readme());
+    const parsed = parseBackendManifest(standalone());
     expect(parsed.backendId).toBe("com.example.agent");
     expect(parsed.capabilities).toEqual(["nodeTrafficLimit"]);
     expect(parsed.presets[0].inputs).toEqual([{ key: "server", label: "节点地址", type: "hostname", placeholder: "node.example.com", help: "公网地址", installArg: "--domain", required: true }]);
     expect(renderPresetConfig(parsed.presets[0].config, { server: "node.example.com" })).toEqual({ server: "node.example.com", port: 443, publicKey: "{{ generated.publicKey }}" });
     expect(renderPresetConfig(parsed.presets[0].config, { server: "node.example.com" }, { publicKey: "pub" })).toEqual({ server: "node.example.com", port: 443, publicKey: "pub" });
+  });
+
+  it("keeps the legacy README recognition block compatible", () => {
+    expect(parseBackendManifest(readme()).backendId).toBe("com.example.agent");
   });
 
   it("keeps legacy requiredInputs compatible but rejects invalid menu metadata", () => {

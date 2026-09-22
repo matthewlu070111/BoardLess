@@ -360,7 +360,7 @@ function NodeDeploy({ returnTo }: { returnTo: string }) {
     finally { setBusy(false); }
   };
   if (!presets) return <Loading />;
-  return <Page title="新增节点" description="选择后端后，配置项由该后端仓库的 README 清单提供" action={<Link className="button" to={returnTo}>返回节点列表</Link>}>
+  return <Page title="新增节点" description="选择后端后，配置项由该后端仓库的识别清单提供" action={<Link className="button" to={returnTo}>返回节点列表</Link>}>
     {error && <Notice tone="danger">{error}</Notice>}
     {!presets.length ? <section className="panel"><Empty>暂无已启用后端，请联系站长先导入并确认后端仓库</Empty></section> : <div className="two-column">
       <form className="panel form-stack" onSubmit={submit}>
@@ -556,7 +556,7 @@ function OwnerBackends() {
   const [backends, setBackends] = useState<Json[] | null>(null);
   const [repositoryUrl, setRepositoryUrl] = useState("");
   const [ref, setRef] = useState("");
-  const [readmePath, setReadmePath] = useState("README.md");
+  const [manifestPath, setManifestPath] = useState("boardless-backend.json");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -565,7 +565,7 @@ function OwnerBackends() {
   const importRepository = async (event: FormEvent) => {
     event.preventDefault(); setBusy(true); setError(""); setNotice("");
     try {
-      const result = await api<Json>("/api/owner/backends/import", { method: "POST", body: JSON.stringify({ repositoryUrl, ref, readmePath }) });
+      const result = await api<Json>("/api/owner/backends/import", { method: "POST", body: JSON.stringify({ repositoryUrl, ref, manifestPath }) });
       setNotice(`已校验 ${result.preview.commitSha.slice(0, 12)} 和 ${result.preview.presets.length} 个预设，请确认后启用。`);
       await load();
     } catch (reason) { setError(reason instanceof Error ? reason.message : "导入失败"); }
@@ -575,14 +575,14 @@ function OwnerBackends() {
   const syncBackend = async (row: Json) => { const nextRef = prompt("输入要同步的分支、标签或提交 SHA", row.requested_ref); if (nextRef === null || !nextRef.trim()) return; setError(""); try { const result = await api<Json>(`/api/owner/backends/${row.id}/sync`, { method: "POST", body: JSON.stringify({ ref: nextRef.trim() }) }); setNotice(result.diff.changed ? "检测到新提交，请检查后重新确认。" : "内容已重新校验，请重新确认。 "); await load(); } catch (reason) { setError(reason instanceof Error ? reason.message : "同步失败"); } };
   const toggleBackend = async (row: Json) => { setError(""); try { await api(`/api/owner/backends/${row.id}`, { method: "PATCH", body: JSON.stringify({ enabled: row.status !== "enabled" }) }); await load(); } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败"); } };
   if (!backends) return <Loading />;
-  return <Page title="后端仓库" description="从公开 GitHub 仓库读取固定提交的 README、校验特征码、预设和安装脚本">
+  return <Page title="后端仓库" description="从公开 GitHub 仓库读取固定提交的识别文件，校验特征码、预设和安装脚本">
     {notice && <Notice tone="success">{notice}</Notice>}{error && <Notice tone="danger">{error}</Notice>}
     <div className="two-column backend-layout">
       <form className="panel form-stack" onSubmit={importRepository}>
         <h2>导入兼容后端</h2>
         <Field label="GitHub 仓库"><input type="url" required value={repositoryUrl} onChange={(event) => setRepositoryUrl(event.target.value)} placeholder="https://github.com/owner/backend" /></Field>
         <Field label="分支、标签或提交 SHA" hint="留空时读取仓库默认分支，但保存时会固定为提交 SHA"><input value={ref} onChange={(event) => setRef(event.target.value)} placeholder="v1.0.0" /></Field>
-        <Field label="README 路径"><input required value={readmePath} onChange={(event) => setReadmePath(event.target.value)} /></Field>
+        <Field label="识别文件路径" hint="新后端使用 boardless-backend.json；旧后端可继续填写 README.md"><input required value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} /></Field>
         <button className="button primary" disabled={busy}>{busy ? "读取并校验…" : "导入并生成预览"}</button>
       </form>
       <section className="panel table-wrap"><h2>已导入后端</h2><table><thead><tr><th>后端</th><th>仓库 / 提交</th><th>预设</th><th>状态</th><th></th></tr></thead><tbody>{backends.map((row) => <tr key={row.id}><td><strong>{row.name}</strong><small className="cell-sub">{row.backend_id} · {row.version}</small></td><td><a href={row.repository_url} target="_blank" rel="noreferrer">{row.repository_owner}/{row.repository_name}</a><small className="cell-sub mono">{String(row.commit_sha).slice(0, 12)}</small></td><td>{row.preset_count}</td><td><Badge value={row.status} /></td><td className="actions">{row.status === "pending" ? <button className="link-button positive" onClick={() => confirmBackend(row.id)}>确认启用</button> : <button className={`link-button ${row.status === "enabled" ? "negative" : "positive"}`} onClick={() => toggleBackend(row)}>{row.status === "enabled" ? "停用" : "启用"}</button>}<button className="link-button" onClick={() => syncBackend(row)}>重新同步</button></td></tr>)}</tbody></table>{!backends.length && <Empty>尚未导入后端仓库</Empty>}</section>

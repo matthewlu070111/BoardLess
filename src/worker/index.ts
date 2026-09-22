@@ -730,8 +730,8 @@ app.get("/api/owner/backends", async (c) => {
 
 app.post("/api/owner/backends/import", async (c) => {
   assertMutation(c);
-  const input = await body<{ repositoryUrl: string; ref?: string; readmePath?: string }>(c);
-  const imported = await importBackendRepository(String(input.repositoryUrl || ""), String(input.ref || ""), String(input.readmePath || "README.md"));
+  const input = await body<{ repositoryUrl: string; ref?: string; manifestPath?: string; readmePath?: string }>(c);
+  const imported = await importBackendRepository(String(input.repositoryUrl || ""), String(input.ref || ""), String(input.manifestPath || input.readmePath || "boardless-backend.json"));
   const saved = await saveImportedBackend(c.env, c.get("user").id, imported);
   return c.json({
     backend: { ...saved, backendId: imported.manifest.backendId, name: imported.manifest.name, version: imported.manifest.version },

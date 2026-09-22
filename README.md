@@ -163,9 +163,21 @@ Cloudflare 还提供两种手动触发构建的方式：Deploy Hook 可以重新
 
 仓库中的 `scripts/deploy-cloudflare.sh` 主要用于本地 CLI 手动部署。只有采用这种方式时，才依赖本地 `.cloudflare.secrets.json` 来保持重复部署时的密钥不变；通过部署按钮和 Workers Builds 更新不需要运行该脚本。
 
-### Linux 一键安装更新
+### Linux 自托管更新（推荐）
 
-重新下载最新安装脚本，并使用原来的域名、安装目录和数据目录执行。下面示例更新到 `v0.2.0`：
+不要在已安装目录里直接执行 `git pull` 或手工覆盖源码；这会绕过安装脚本对 `.env.docker`、数据库备份和 Docker 配置的处理。正确方式是：继续使用同一个一键安装脚本，以已有安装的目录和数据目录重新执行升级。
+
+脚本会在检测到现有 `compose.install.yml` 时自动进入“安全升级”模式：
+
+- 停止现有 BoardLess 容器
+- 备份 SQLite 到 `DATA_DIR/backups/`
+- 读取并保留现有 `.env.docker`、`APP_ORIGIN`、`SESSION_SECRET` 和 `BOOTSTRAP_SECRET`
+- 覆盖程序代码和 Docker 配置
+- 重建镜像并重新启动服务
+- 自动执行未应用的数据库 migration
+- 等待健康检查通过
+
+推荐更新命令如下，示例更新到 `v0.2.0`：
 
 ```bash
 curl -fsSL \
@@ -183,18 +195,20 @@ sudo bash /tmp/boardless-update.sh \
   --unattended
 ```
 
-如果首次安装没有使用 Caddy，应去掉 `--with-caddy`，并按需继续传入原来的 `--listen-port`。`--version` 也可以填写确定的提交 SHA。
+如果第一次安装没有启用 Caddy，就不要传 `--with-caddy`，并补上原来的 `--listen-port`。如果当前站点使用的是原来的端口 3000，保持一致即可。
 
-脚本检测到已有的 `compose.install.yml` 后会执行安全升级：停止 BoardLess 容器，将 SQLite 复制到数据目录下的 `backups/`，保留原有 `.env.docker` 和密钥，覆盖程序文件，重新构建镜像并启动服务。容器启动时会自动执行尚未应用的 SQLite migration，随后脚本会等待健康检查通过。
+`--version` 也可以改成确定的提交 SHA；如果你已经在本地维护源码副本，可以改用 `--source-dir /path/to/boardless`。但无论哪种方式，更新都应使用同一套安装目录和数据目录，而不是新建目录覆盖旧安装。
 
-升级失败时可通过以下命令查看日志：
+更新失败时，先看服务日志：
 
 ```bash
 sudo /opt/boardless/boardlessctl status
 sudo /opt/boardless/boardlessctl logs --tail 200 boardless
 ```
 
-需要回滚时，应重新运行安装脚本安装原来的版本标签或提交 SHA，并在停止服务后恢复 `/var/lib/boardless/backups/` 中对应的 SQLite 备份。恢复数据库会覆盖升级后的数据，执行前应额外保留当前数据库副本。
+如果需要回滚，应重新运行同一脚本，传回原来的版本标签或提交 SHA，并在恢复数据库前保留当前数据目录中的备份。恢复时直接将 `/var/lib/boardless/backups/` 中对应的 SQLite 文件覆盖当前数据库即可；该操作会覆盖升级后的数据，因此请先额外备份当前状态。
+
+> 结论：正确的自托管更新方式是“重新执行安装脚本”，而不是“在安装目录里手工 `git pull` 后重启”。这能保证环境变量、密钥、数据库备份、Caddy 配置和 Docker 编排保持一致。
 
 ## 本地开发
 

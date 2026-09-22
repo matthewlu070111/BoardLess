@@ -2,6 +2,7 @@ import React, { createContext, FormEvent, ReactNode, useContext, useEffect, useS
 import { createRoot } from "react-dom/client";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { BrowserRouter } from "react-router-dom";
+import { inviteActionLabel, inviteSuccessMessage } from "./invite";
 import "./styles.css";
 
 type Role = "user" | "admin" | "owner";
@@ -388,8 +389,8 @@ function AdminUsers() {
   const invite = async () => { const result = await api<Json>("/api/admin/invitations", { method: "POST", body: JSON.stringify({ expiresHours: 72 }) }); setLink(result.url); await navigator.clipboard.writeText(result.url); };
   const toggle = async (user: Json) => { await api(`/api/admin/users/${user.id}`, { method: "PATCH", body: JSON.stringify({ status: user.status === "active" ? "disabled" : "active" }) }); await load(); };
   if (!users) return <Loading />;
-  return <Page title="邀请用户" description="用户归属关系创建后不可修改" action={<button className="button primary" onClick={invite}>生成邀请链接</button>}>
-    {link && <Notice tone="success">邀请链接已复制，有效期 72 小时：<code className="token">{link}</code></Notice>}
+  return <Page title="邀请用户" description="用户归属关系创建后不可修改" action={<button className="button primary" onClick={invite}>{inviteActionLabel("user")}</button>}>
+    {link && <Notice tone="success">{inviteSuccessMessage("user")}，有效期 72 小时：<code className="token">{link}</code></Notice>}
     <section className="panel table-wrap"><table><thead><tr><th>邮箱</th><th>状态</th>{siteMode === "plan" && <th>套餐到期</th>}<th>加入时间</th><th></th></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.email}</td><td><Badge value={user.status} /></td>{siteMode === "plan" && <td>{date(user.expires_at)}</td>}<td>{date(user.created_at)}</td><td><button className="link-button" onClick={() => toggle(user)}>{user.status === "active" ? "停用" : "恢复"}</button></td></tr>)}</tbody></table>{!users.length && <Empty>还没有受邀用户</Empty>}</section>
   </Page>;
 }
@@ -459,8 +460,8 @@ function OwnerUsers() {
   const managePlans = async (user: Json) => { setPlanUser(user); setEntitlements(null); setError(""); try { const result = await api<Json>(`/api/owner/users/${user.id}/entitlements`); setEntitlements(result.entitlements); } catch (reason) { setError(reason instanceof Error ? reason.message : "读取套餐失败"); setEntitlements([]); } };
   const cancelPlan = (entitlement: Json) => { if (!planUser) return; const target = planUser; setDanger({ title: `取消“${target.email}”的套餐`, description: `“${entitlement.planName}”将立即失效，待生效套餐也会被撤销，系统不会自动退款。`, confirmLabel: "确认取消套餐", run: async () => { await api(`/api/owner/users/${target.id}/entitlements/${entitlement.id}/cancel`, { method: "POST", body: "{}" }); const result = await api<Json>(`/api/owner/users/${target.id}/entitlements`); setEntitlements(result.entitlements); } }); };
   if (!users) return <Loading />;
-  return <Page title="账号管理" description="管理账号状态与基础财务信息；节点权限在专用页面配置" action={<button className="button primary" onClick={invite}>邀请管理员</button>}>
-    {link && <Notice tone="success">管理员邀请链接已复制：<code className="token">{link}</code></Notice>}
+  return <Page title="账号管理" description="管理账号状态与基础财务信息；节点权限在专用页面配置" action={<button className="button primary" onClick={invite}>{inviteActionLabel("admin")}</button>}>
+    {link && <Notice tone="success">{inviteSuccessMessage("admin")}：<code className="token">{link}</code></Notice>}
     <section className="panel table-wrap"><table><thead><tr><th>邮箱</th><th>角色</th><th>归属管理员</th><th>余额</th><th>状态</th><th>加入时间</th><th></th></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.email}</td><td>{user.roles.join(" / ")}</td><td>{user.inviter_email || "—"}</td><td>{money(user.wallet_cents)}</td><td><Badge value={user.status} /></td><td>{date(user.created_at)}</td><td className="actions">{siteMode === "plan" && user.roles.includes("admin") && <button className="link-button" onClick={() => commission(user)}>佣金比例</button>}{siteMode === "plan" && user.roles.includes("user") && <button className="link-button" onClick={() => managePlans(user)}>套餐管理</button>}<button className="link-button" onClick={() => balance(user)}>修改余额</button><button className="link-button" onClick={() => toggle(user)}>{user.status === "active" ? "停用" : "恢复"}</button></td></tr>)}</tbody></table></section>
     {planUser && <div className="modal-layer"><section className="modal"><button type="button" className="modal-close" onClick={() => setPlanUser(null)}>×</button><p className="eyebrow">账号套餐</p><h2>{planUser.email}</h2><p className="muted">取消后权益立即失效，待生效套餐也会被撤销；系统不会自动退款。</p>{error && <Notice tone="danger">{error}</Notice>}{entitlements === null ? <Loading /> : entitlements.length ? <div className="form-stack">{entitlements.map((entitlement) => <section className="panel" key={entitlement.id}><div className="row-between"><div><strong>{entitlement.planName}</strong><small className="cell-sub">{entitlement.status === "queued" ? "待生效" : "当前生效"} · {date(entitlement.startsAt)} 至 {date(entitlement.endsAt)}</small><small className="cell-sub">额度 {bytes(entitlement.quotaBytes)} · 订单 {entitlement.orderId}</small></div><button className="button" onClick={() => cancelPlan(entitlement)}>取消套餐</button></div></section>)}</div> : <Empty>该账号没有当前或待生效套餐</Empty>}<div className="modal-actions"><button className="button" onClick={() => setPlanUser(null)}>关闭</button></div></section></div>}
     <DangerDialog action={danger} onClose={() => setDanger(null)} />

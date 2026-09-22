@@ -337,12 +337,18 @@ ensure_docker() {
           "$(dpkg --print-architecture)" "$ID" "$docker_codename" \
           > /etc/apt/sources.list.d/docker.list
         apt-get update
+        if dpkg-query -W -f='${Status}' docker-buildx 2>/dev/null | grep -q 'install ok installed'; then
+          log "移除与 Docker 官方 Buildx 插件冲突的 Debian docker-buildx 包"
+          apt-get remove -y docker-buildx
+        fi
         if ! command -v docker >/dev/null 2>&1; then
           log "安装 Docker"
           apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        elif ! docker compose version >/dev/null 2>&1; then
-          log "安装 Docker Compose 插件"
-          apt-get install -y docker-compose-plugin
+        else
+          if ! docker compose version >/dev/null 2>&1; then
+            log "安装 Docker Compose 插件"
+          fi
+          apt-get install -y docker-buildx-plugin docker-compose-plugin
         fi
         ;;
       *)

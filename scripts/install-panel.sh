@@ -317,14 +317,45 @@ ensure_base_tools() {
 }
 
 ensure_docker() {
-  if ! command -v docker >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    . /etc/os-release
+    case "${ID:-}" in
+      ubuntu|debian)
+        local docker_codename="${VERSION_CODENAME:-}"
+        if [[ "${ID}" == "ubuntu" && -n "${UBUNTU_CODENAME:-}" ]]; then
+          docker_codename="$UBUNTU_CODENAME"
+        fi
+        [[ -n "$docker_codename" ]] || die "无法识别 ${ID} 的 Debian 发行版代号，不能配置 Docker 官方源"
+        log "配置 Docker 官方 APT 源（${ID} ${docker_codename}）"
+        apt-get update
+        apt-get install -y ca-certificates curl
+        install -d -m 0755 /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/${ID}/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/%s %s stable\n' \
+          "$(dpkg --print-architecture)" "$ID" "$docker_codename" \
+          > /etc/apt/sources.list.d/docker.list
+        apt-get update
+        if ! command -v docker >/dev/null 2>&1; then
+          log "安装 Docker"
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        elif ! docker compose version >/dev/null 2>&1; then
+          log "安装 Docker Compose 插件"
+          apt-get install -y docker-compose-plugin
+        fi
+        ;;
+      *)
+        if ! command -v docker >/dev/null 2>&1; then
+          apt-get update
+          apt-get install -y docker.io
+        fi
+        apt-get install -y docker-compose-v2 || apt-get install -y docker-compose-plugin
+        ;;
+    esac
+  elif ! command -v docker >/dev/null 2>&1; then
     log "安装 Docker"
-    if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y docker.io
-      apt-get install -y docker-compose-v2 || apt-get install -y docker-compose-plugin
-    elif command -v dnf >/dev/null 2>&1; then
+    if command -v dnf >/dev/null 2>&1; then
       dnf install -y docker docker-compose-plugin
     elif command -v yum >/dev/null 2>&1; then
       yum install -y docker docker-compose-plugin

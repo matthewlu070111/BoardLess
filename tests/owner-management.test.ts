@@ -149,6 +149,36 @@ describe("owner account and node management", () => {
     database.close();
   });
 
+  it("lets the owner invite both admins and regular users", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "boardless-owner-invite-"));
+    directories.push(directory);
+    const database = new LocalDatabase(join(directory, "test.sqlite"));
+    database.migrate(resolve("migrations"));
+    const db = database.asD1();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const session = "owner-invite-session";
+    await db.batch([
+      db.prepare("INSERT INTO users (id, email, password_hash, access_uuid, access_secret, created_at) VALUES ('owner', 'owner@example.com', 'x', 'owner-uuid', 'owner-secret', ?) ").bind(timestamp),
+      db.prepare("INSERT INTO user_roles (user_id, role) VALUES ('owner', 'owner')"),
+      db.prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, 'owner', ?, ?) ").bind(await sha256(session), timestamp + 3600, timestamp),
+    ]);
+    const env: Env = { DB: db, ASSETS: {} as Fetcher, APP_ORIGIN: "https://panel.example.com", SESSION_SECRET: "secret", BOOTSTRAP_SECRET: "bootstrap", ALIPAY_APP_ID: "", ALIPAY_PRIVATE_KEY: "", ALIPAY_PUBLIC_KEY: "", ALIPAY_GATEWAY: "" };
+    const headers = { "content-type": "application/json", cookie: `boardless_session=${session}` };
+
+    const userInvite = await app.request("http://localhost/api/owner/invitations", { method: "POST", headers, body: JSON.stringify({ role: "user", expiresHours: 72 }) }, env);
+    expect(userInvite.status).toBe(201);
+    const userInviteJson = await userInvite.json() as { role: string; url: string };
+    expect(userInviteJson.role).toBe("user");
+    expect(userInviteJson.url).toContain("/invite/");
+    expect(await db.prepare("SELECT role FROM invitations WHERE inviter_id = 'owner' ORDER BY created_at DESC LIMIT 1").first()).toEqual({ role: "user" });
+
+    const adminInvite = await app.request("http://localhost/api/owner/invitations", { method: "POST", headers, body: JSON.stringify({ role: "admin", expiresHours: 48 }) }, env);
+    expect(adminInvite.status).toBe(201);
+    const adminInviteJson = await adminInvite.json() as { role: string };
+    expect(adminInviteJson.role).toBe("admin");
+    database.close();
+  });
+
   it("lets the owner cancel account entitlements and only delete unused plans", async () => {
     const directory = mkdtempSync(join(tmpdir(), "boardless-plan-cancel-"));
     directories.push(directory);

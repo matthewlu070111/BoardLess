@@ -561,7 +561,7 @@ async function createInvitation(env: Env, inviterId: string, role: "user" | "adm
   const id = newId("inv");
   await env.DB.prepare("INSERT INTO invitations (id, token_hash, role, inviter_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .bind(id, await sha256(token), role, inviterId, now() + Math.min(168, Math.max(1, expiresHours)) * 3600, now()).run();
-  return { id, token, expiresAt: now() + Math.min(168, Math.max(1, expiresHours)) * 3600 };
+  return { id, token, role, expiresAt: now() + Math.min(168, Math.max(1, expiresHours)) * 3600 };
 }
 
 async function saveImportedBackend(env: Env, actorId: string, imported: ImportedBackend) {
@@ -1474,9 +1474,10 @@ app.put("/api/owner/users/:id/node-grants", async (c) => {
 
 app.post("/api/owner/invitations", async (c) => {
   assertMutation(c);
-  const input = await body<{ expiresHours?: number }>(c);
-  const invite = await createInvitation(c.env, c.get("user").id, "admin", Number(input.expiresHours || 72));
-  await audit(c.env, c.get("user").id, "invitation.create", "invitation", invite.id, { role: "admin" });
+  const input = await body<{ expiresHours?: number; role?: "user" | "admin" }>(c);
+  const role = input.role === "user" ? "user" : "admin";
+  const invite = await createInvitation(c.env, c.get("user").id, role, Number(input.expiresHours || 72));
+  await audit(c.env, c.get("user").id, "invitation.create", "invitation", invite.id, { role });
   return c.json({ ...invite, url: `${c.env.APP_ORIGIN.replace(/\/$/, "")}/invite/${invite.token}` }, 201);
 });
 
